@@ -53,7 +53,20 @@ TIM_HandleTypeDef htim4;
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
+// Flags and tracking variables
+uint8_t start_polarimeter_scan = 0;
+uint16_t scan_steps = 0;
+uint32_t last_dht22_read = 0;
+uint32_t last_sensor_send = 0;
 
+// Motor tracking structure
+typedef struct {
+    uint32_t target_duty;
+    uint32_t current_duty;
+    uint32_t turn_off_time;
+} DC_Motor_t;
+
+DC_Motor_t dc_motor1 = {0, 0, 0};
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -67,7 +80,9 @@ static void MX_TIM3_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_USART3_UART_Init(void);
 /* USER CODE BEGIN PFP */
-
+void Process_USB_Command(uint8_t* buffer, uint32_t length);
+void Run_Polarimeter_Scan(uint16_t steps);
+void Read_CO2_Sensor(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -112,8 +127,13 @@ int main(void)
   MX_TIM4_Init();
   MX_USART3_UART_Init();
   MX_USB_DEVICE_Init();
-  /* USER CODE BEGIN 2 */
 
+  /* USER CODE BEGIN 2 */
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); // DC Motor PWM
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1); // Servo PWM
+  // Reset our timers
+  last_dht22_read = HAL_GetTick();
+  last_sensor_send = HAL_GetTick();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -121,10 +141,48 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-
     /* USER CODE BEGIN 3 */
-  }
-  /* USER CODE END 3 */
+    uint32_t current_time = HAL_GetTick();
+
+    // 1. Auto-off handler for the DC Motor
+    if (dc_motor1.turn_off_time != 0 && current_time >= dc_motor1.turn_off_time) {
+        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0); // Turn off PWM
+        dc_motor1.current_duty = 0;
+        dc_motor1.target_duty = 0;
+        dc_motor1.turn_off_time = 0; // Reset tracking
+    }
+
+    // 2. Linear Motor Ramping logic (Runs every 10ms)
+    static uint32_t last_ramp_time = 0;
+    if (current_time - last_ramp_time >= 10) {
+        last_ramp_time = current_time;
+        
+        if (dc_motor1.current_duty < dc_motor1.target_duty) {
+            dc_motor1.current_duty++;
+            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, dc_motor1.current_duty);
+        } else if (dc_motor1.current_duty > dc_motor1.target_duty) {
+            dc_motor1.current_duty--;
+            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, dc_motor1.current_duty);
+        }
+    }
+
+    // 3. Polarimeter Scan execution (Triggered safely outside the interrupt)
+    if (start_polarimeter_scan) {
+        Run_Polarimeter_Scan(scan_steps);
+        start_polarimeter_scan = 0; // Clear flag when finished
+    }
+
+    // 4. Periodic Sensor Readings (Every 2 seconds)
+    if (current_time - last_dht22_read >= 2000) {
+        last_dht22_read = current_time;
+        
+        Read_CO2_Sensor();
+        // Read_DHT22(); // UNCOMMENT WHEN FUNCTION MADE
+        // other functions to call??? 
+        
+        // Send compiled sensor variables back to computer over USB
+        // CDC_Transmit_FS(sensor_data_buffer, size);
+    }
 }
 
 /**
@@ -559,6 +617,61 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void Process_USB_Command(uint8_t* buffer, uint32_t length) {
+    if (length < 1) return;
+    
+    uint8_t cmd_type = buffer[0];
+    
+    switch(cmd_type) {
+        case 1: // DC Motor Command
+            dc_motor1.target_duty = buffer[1];
+            // Compute turn-off timestamp from bytes 2 and 3
+            uint32_t duration = (buffer[2] << 8) | buffer[3];
+            dc_motor1.turn_off_time = HAL_GetTick() + duration;
+            break;
+            
+        case 2: // Servo Command
+            // Update the compare register directly
+            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, buffer[1]);
+            break;
+            
+        case 3: // Polarimeter Scan Command
+            scan_steps = (buffer[1] << 8) | buffer[2];
+            start_polarimeter_scan = 1; // Flag the loop to run it safely
+            break;
+    }
+}
+
+void Run_Polarimeter_Scan(uint16_t steps) {
+    for (uint16_t i = 0; i < steps; i++) {
+        // 1. Pulse stepper pin (Example: Pins must be configured in CubeMX)
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET);
+        HAL_Delay(5);
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET);
+        HAL_Delay(5);
+        
+        // 2. Read ADC Sample
+        HAL_ADC_Start(&hadc1);
+        if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
+            uint16_t adc_val = HAL_ADC_GetValue(&hadc1);
+            // Save or stream adc_val back via USB here
+        }
+        HAL_ADC_Stop(&hadc1);
+    }
+}
+
+void Read_CO2_Sensor(void) {
+    uint8_t cmd[9] = {0xFF, 0x01, 0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x79};
+    uint8_t resp[9] = {0};
+    HAL_UART_Transmit(&huart3, cmd, 9, 100);
+    if (HAL_UART_Receive(&huart3, resp, 9, 200) == HAL_OK) {
+        // need to add
+    }
+}
+
+void Read_DHT22(void){
+  // need to add
+}
 
 /* USER CODE END 4 */
 

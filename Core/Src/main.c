@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "usb_device.h"
+#include <string.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -27,6 +28,36 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+
+#define MAGIC0 0xAA
+#define MAGIC1 0x55
+
+#define TYPE_DC     0x00
+#define TYPE_SERVO  0x01
+#define TYPE_POLAR  0x02
+
+#define TYPE_SENSORS 0x01
+
+#pragma pack(push,1)
+
+typedef struct
+{
+    uint8_t pin;
+    uint8_t type;
+    uint16_t duty_cycle;
+    uint16_t duration;
+    uint16_t ramp;   
+} PwmCommand;
+
+typedef struct
+{
+    uint16_t methane;
+    uint16_t co2;
+    float temperature;
+    float moisture;
+} SensorReadings;
+
+#pragma pack(pop)
 
 /* USER CODE END PTD */
 
@@ -82,12 +113,24 @@ static void MX_USART3_UART_Init(void);
 /* USER CODE BEGIN PFP */
 void Process_USB_Command(uint8_t* buffer, uint32_t length);
 void Run_Polarimeter_Scan(uint16_t steps);
-void Read_CO2_Sensor(void);
+uint16_t Read_CO2_Sensor(void);
+void Read_DHT22(float *temperature, float *humidity);
+uint16_t Read_Methane(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+uint8_t CalcChecksum(const uint8_t *data, uint32_t len)
+{
+    uint8_t checksum = 0;
 
+    for(uint32_t i = 0; i < len; i++)
+    {
+        checksum ^= data[i];
+    }
+
+    return checksum;
+}
 /* USER CODE END 0 */
 
 /**
@@ -174,15 +217,22 @@ int main(void)
 
     // 4. Periodic Sensor Readings (Every 2 seconds)
     if (current_time - last_dht22_read >= 2000) {
-        last_dht22_read = current_time;
-        
-        Read_CO2_Sensor();
-        // Read_DHT22(); // UNCOMMENT WHEN FUNCTION MADE
-        // other functions to call??? 
-        
-        // Send compiled sensor variables back to computer over USB
-        // CDC_Transmit_FS(sensor_data_buffer, size);
+      last_dht22_read = current_time;
+
+      SensorReadings pkt;
+
+      pkt.methane = Read_Methane();
+      pkt.co2 = Read_CO2_Sensor();
+
+      Read_DHT22(&pkt.temperature, &pkt.moisture);
+
+      SendFramedPacket(
+          TYPE_SENSORS,
+          (uint8_t*)&pkt,
+          sizeof(pkt)
+      );
     }
+  }
 }
 
 /**
@@ -617,27 +667,65 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-void Process_USB_Command(uint8_t* buffer, uint32_t length) {
-    if (length < 1) return;
-    
-    uint8_t cmd_type = buffer[0];
-    
-    switch(cmd_type) {
-        case 1: // DC Motor Command
-            dc_motor1.target_duty = buffer[1];
-            // Compute turn-off timestamp from bytes 2 and 3
-            uint32_t duration = (buffer[2] << 8) | buffer[3];
-            dc_motor1.turn_off_time = HAL_GetTick() + duration;
+extern uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len);
+
+void SendFramedPacket(uint8_t type,
+                      const uint8_t *payload,
+                      uint16_t payload_len)
+{
+    uint8_t packet[64];
+
+    if(payload_len + 4 > sizeof(packet))
+        return;
+
+    packet[0] = MAGIC0;
+    packet[1] = MAGIC1;
+    packet[2] = type;
+
+    memcpy(&packet[3], payload, payload_len);
+
+    packet[3 + payload_len] =
+        CalcChecksum(payload, payload_len);
+
+    CDC_Transmit_FS(packet, payload_len + 4);
+}
+
+void Process_USB_Command(uint8_t *buffer, uint32_t length)
+{
+    // Packet should be:
+    // AA 55 <PwmCommand> <checksum>
+
+    if (length < sizeof(PwmCommand) + 3)
+        return;
+
+    // Verify header
+    if (buffer[0] != MAGIC0 || buffer[1] != MAGIC1)
+        return;
+
+    // Verify checksum
+    uint8_t checksum = CalcChecksum(&buffer[2], sizeof(PwmCommand));
+
+    if (checksum != buffer[2 + sizeof(PwmCommand)])
+        return;
+
+    // Extract command
+    PwmCommand cmd;
+    memcpy(&cmd, &buffer[2], sizeof(PwmCommand));
+
+    switch (cmd.type)
+    {
+        case TYPE_DC:
+            dc_motor1.target_duty = cmd.duty_cycle;
+            dc_motor1.turn_off_time = HAL_GetTick() + (cmd.duration * 100);
             break;
-            
-        case 2: // Servo Command
-            // Update the compare register directly
-            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, buffer[1]);
+
+        case TYPE_SERVO:
+            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, cmd.duty_cycle);
             break;
-            
-        case 3: // Polarimeter Scan Command
-            scan_steps = (buffer[1] << 8) | buffer[2];
-            start_polarimeter_scan = 1; // Flag the loop to run it safely
+
+        case TYPE_POLAR:
+            scan_steps = cmd.duration;
+            start_polarimeter_scan = 1;
             break;
     }
 }
@@ -660,19 +748,28 @@ void Run_Polarimeter_Scan(uint16_t steps) {
     }
 }
 
-void Read_CO2_Sensor(void) {
+uint16_t Read_CO2_Sensor(void)
+{
     uint8_t cmd[9] = {0xFF, 0x01, 0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x79};
     uint8_t resp[9] = {0};
+
     HAL_UART_Transmit(&huart3, cmd, 9, 100);
-    if (HAL_UART_Receive(&huart3, resp, 9, 200) == HAL_OK) {
-        // need to add
+
+    if (HAL_UART_Receive(&huart3, resp, 9, 200) == HAL_OK)
+    {
+        return (resp[2] << 8) | resp[3];
     }
+
+    return 0;
 }
 
-void Read_DHT22(void){
+void Read_DHT22(float *temperature, float *humidity){
   // need to add
 }
 
+uint16_t Read_Methane(void) {
+  // need to add
+}
 /* USER CODE END 4 */
 
 /**

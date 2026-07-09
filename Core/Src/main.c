@@ -38,6 +38,9 @@
 #define TYPE_POLAR  0x02
 
 #define TYPE_SENSORS 0x01
+#define TYPE_POLAR_DATA 0x02  
+#define POLAR_SAMPLES_PER_CHUNK 30  
+
 
 #pragma pack(push,1)
 
@@ -827,6 +830,8 @@ void Process_USB_Command(uint8_t *buffer, uint32_t length)
 
 void Run_Polarimeter_Scan(uint16_t steps) {
     ADC_ChannelConfTypeDef sConfig = {0};
+    uint16_t sample_buf[POLAR_SAMPLES_PER_CHUNK];
+    uint16_t sample_count = 0;
 
     for (uint16_t i = 0; i < steps; i++) {
         // Pulse stepper pin
@@ -844,10 +849,30 @@ void Run_Polarimeter_Scan(uint16_t steps) {
         // Read ADC Sample
         HAL_ADC_Start(&hadc1);
         if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
-            uint16_t adc_val = HAL_ADC_GetValue(&hadc1);
-            // TODO: store/send adc_val
+            sample_buf[sample_count++] = (uint16_t)HAL_ADC_GetValue(&hadc1);
+        } else {
+            sample_buf[sample_count++] = 0xFFFF; // sentinel for a failed/missed read
         }
         HAL_ADC_Stop(&hadc1);
+
+        // Flush a full chunk
+        if (sample_count == POLAR_SAMPLES_PER_CHUNK) {
+            SendFramedPacket(
+                TYPE_POLAR_DATA,
+                (uint8_t*)sample_buf,
+                sample_count * sizeof(uint16_t)
+            );
+            sample_count = 0;
+        }
+    }
+
+    // Flush any remaining partial chunk
+    if (sample_count > 0) {
+        SendFramedPacket(
+            TYPE_POLAR_DATA,
+            (uint8_t*)sample_buf,
+            sample_count * sizeof(uint16_t)
+        );
     }
 }
 

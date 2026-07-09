@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "usb_device.h"
+#include "usbd_cdc_if.h"
 #include <string.h>
 
 /* Private includes ----------------------------------------------------------*/
@@ -51,15 +52,13 @@ typedef struct
 
 typedef struct
 {
-    uint16_t methane;
+    uint16_t methane;      // ADC_CHANNEL_0 
     uint16_t co2;
     float temperature;
     float moisture;
-    uint16_t tof_distance; // <-- ADDED: Holds the ToF sensor reading
-    uint16_t gas_pa4;      // <-- ADDED: Secondary Gas Sensor 1
-    uint16_t gas_pa5;      // <-- ADDED: Secondary Gas Sensor 2
-
-  } SensorReadings;
+    uint16_t adc2;         // ADC_CHANNEL_1 
+    uint16_t adc3;         // ADC_CHANNEL_4 
+} SensorReadings;
 
 #pragma pack(pop)
 
@@ -94,6 +93,32 @@ uint16_t scan_steps = 0;
 uint32_t last_dht22_read = 0;
 uint32_t last_sensor_send = 0;
 
+#define NUM_DC_MOTORS 6
+#define NUM_SERVOS    4
+
+typedef struct {
+    TIM_HandleTypeDef *htim;
+    uint32_t channel;
+} PwmMap_t;
+
+// timer, channel for DC motors (Motor 1-3 on TIM1, Motor 4-6 on TIM2)
+static const PwmMap_t dc_motor_map[NUM_DC_MOTORS] = {
+    { &htim1, TIM_CHANNEL_1 },  // Motor 1
+    { &htim1, TIM_CHANNEL_2 },  // Motor 2
+    { &htim1, TIM_CHANNEL_3 },  // Motor 3
+    { &htim2, TIM_CHANNEL_1 },  // Motor 4
+    { &htim2, TIM_CHANNEL_2 },  // Motor 5
+    { &htim2, TIM_CHANNEL_3 },  // Motor 6
+};
+
+// timer, channel for servos
+static const PwmMap_t servo_map[NUM_SERVOS] = {
+    { &htim3, TIM_CHANNEL_1 },
+    { &htim3, TIM_CHANNEL_2 },
+    { &htim3, TIM_CHANNEL_3 },
+    { &htim3, TIM_CHANNEL_4 },
+};
+
 // Motor tracking structure
 typedef struct {
     uint32_t target_duty;
@@ -101,7 +126,7 @@ typedef struct {
     uint32_t turn_off_time;
 } DC_Motor_t;
 
-DC_Motor_t dc_motor1 = {0, 0, 0};
+DC_Motor_t dc_motors[NUM_DC_MOTORS] = {0};
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -120,9 +145,9 @@ void Run_Polarimeter_Scan(uint16_t steps);
 uint16_t Read_CO2_Sensor(void);
 void Read_DHT22(float *temperature, float *humidity);
 uint16_t Read_Methane(void);
-uint16_t Read_ToF_Distance(void); // <-- ADDED
-uint16_t Read_Secondary_Gas(uint32_t channel); // <-- ADDED: Dynamic analog reader
-void SendFramedPacket(uint8_t type, const uint8_t *payload, uint16_t payload_len); // <-- ADDING the function prototype
+uint16_t Read_Analog_Input(uint32_t channel);
+void SendFramedPacket(uint8_t type, const uint8_t *payload, uint16_t payload_len);
+void Delay_us(uint16_t us);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -179,31 +204,20 @@ int main(void)
   MX_USB_DEVICE_Init();
 
   /* USER CODE BEGIN 2 */
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); // DC Motor PWM
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1); // Servo PWM
-  
-  HAL_TIM_Base_Start(&htim4);// <--- STARTs TIMER 4 CLOCK
-  
-  // --- ADDED: Configure PB7 and TIM4 CH2 for Input Capture ---
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-  
-  GPIO_InitStruct.Pin = GPIO_PIN_7;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT; // Configured for Input Capture
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  // Start PWM output on every mapped DC motor channel
+  for (int i = 0; i < NUM_DC_MOTORS; i++) {
+      HAL_TIM_PWM_Start(dc_motor_map[i].htim, dc_motor_map[i].channel);
+  }
 
-  TIM_IC_InitTypeDef sConfigIC = {0};
-  sConfigIC.ICPolarity = TIM_ICPOLARITY_RISING;
-  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
-  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
-  sConfigIC.ICFilter = 4; // Adding a small filter to eliminate signal bounce
-  HAL_TIM_IC_ConfigChannel(&htim4, &sConfigIC, TIM_CHANNEL_2);
+  // Start PWM output on every mapped servo channel
+  for (int i = 0; i < NUM_SERVOS; i++) {
+      HAL_TIM_PWM_Start(servo_map[i].htim, servo_map[i].channel);
+  }
 
-  HAL_TIM_IC_Start(&htim4, TIM_CHANNEL_2); // Start the input capture channel
-  // -----------------------------------------------------------
+  // Free-running 1MHz counter on TIM4, used by Delay_us() and Read_DHT22()'s timeouts
+  HAL_TIM_Base_Start(&htim4);
 
-  // Reset our timers
+  // Reset timers
   last_dht22_read = HAL_GetTick();
   last_sensor_send = HAL_GetTick();
   /* USER CODE END 2 */
@@ -216,35 +230,39 @@ int main(void)
     /* USER CODE BEGIN 3 */
     uint32_t current_time = HAL_GetTick();
 
-    // 1. Auto-off handler for the DC Motor
-    if (dc_motor1.turn_off_time != 0 && current_time >= dc_motor1.turn_off_time) {
-        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0); // Turn off PWM
-        dc_motor1.current_duty = 0;
-        dc_motor1.target_duty = 0;
-        dc_motor1.turn_off_time = 0; // Reset tracking
-    }
-
-    // 2. Linear Motor Ramping logic (Runs every 10ms)
-    static uint32_t last_ramp_time = 0;
-    if (current_time - last_ramp_time >= 10) {
-        last_ramp_time = current_time;
-        
-        if (dc_motor1.current_duty < dc_motor1.target_duty) {
-            dc_motor1.current_duty++;
-            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, dc_motor1.current_duty);
-        } else if (dc_motor1.current_duty > dc_motor1.target_duty) {
-            dc_motor1.current_duty--;
-            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, dc_motor1.current_duty);
+    // Auto-off for DC motors
+    for (int i = 0; i < NUM_DC_MOTORS; i++) {
+        if (dc_motors[i].turn_off_time != 0 && current_time >= dc_motors[i].turn_off_time) {
+            __HAL_TIM_SET_COMPARE(dc_motor_map[i].htim, dc_motor_map[i].channel, 0);
+            dc_motors[i].current_duty = 0;
+            dc_motors[i].target_duty = 0;
+            dc_motors[i].turn_off_time = 0;
         }
     }
 
-    // 3. Polarimeter Scan execution (Triggered safely outside the interrupt)
+    // Linear Motor Ramping
+    static uint32_t last_ramp_time = 0;
+    if (current_time - last_ramp_time >= 10) {
+        last_ramp_time = current_time;
+
+        for (int i = 0; i < NUM_DC_MOTORS; i++) {
+            if (dc_motors[i].current_duty < dc_motors[i].target_duty) {
+                dc_motors[i].current_duty++;
+                __HAL_TIM_SET_COMPARE(dc_motor_map[i].htim, dc_motor_map[i].channel, dc_motors[i].current_duty);
+            } else if (dc_motors[i].current_duty > dc_motors[i].target_duty) {
+                dc_motors[i].current_duty--;
+                __HAL_TIM_SET_COMPARE(dc_motor_map[i].htim, dc_motor_map[i].channel, dc_motors[i].current_duty);
+            }
+        }
+    }
+
+    // Polarimeter
     if (start_polarimeter_scan) {
         Run_Polarimeter_Scan(scan_steps);
         start_polarimeter_scan = 0; // Clear flag when finished
     }
 
-    // 4. Periodic Sensor Readings (Every 2 seconds)
+    // Sensor Readings
     if (current_time - last_dht22_read >= 2000) {
       last_dht22_read = current_time;
 
@@ -252,11 +270,10 @@ int main(void)
 
       pkt.methane = Read_Methane();
       pkt.co2 = Read_CO2_Sensor();
-      pkt.tof_distance = Read_ToF_Distance(); // <-- ADDED: Sample the ToF sensor
 
-      // Secondary Analog Cluster
-      pkt.gas_pa4 = Read_Secondary_Gas(ADC_CHANNEL_4); // <-- ADDED: Samples PA4
-      pkt.gas_pa5 = Read_Secondary_Gas(ADC_CHANNEL_5); // <-- ADDED: Samples PA5
+      // analog inputs
+      pkt.adc2 = Read_Analog_Input(ADC_CHANNEL_1);
+      pkt.adc3 = Read_Analog_Input(ADC_CHANNEL_4);
 
       Read_DHT22(&pkt.temperature, &pkt.moisture);
 
@@ -267,6 +284,7 @@ int main(void)
       );
     }
   }
+  /* USER CODE END 3 */
 }
 
 /**
@@ -288,9 +306,6 @@ void SystemClock_Config(void)
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
   RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
@@ -303,8 +318,6 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
@@ -343,8 +356,6 @@ static void MX_ADC1_Init(void)
 
   /* USER CODE END ADC1_Init 1 */
 
-  /** Common config
-  */
   hadc1.Instance = ADC1;
   hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
   hadc1.Init.ContinuousConvMode = DISABLE;
@@ -357,8 +368,6 @@ static void MX_ADC1_Init(void)
     Error_Handler();
   }
 
-  /** Configure Regular Channel
-  */
   sConfig.Channel = ADC_CHANNEL_0;
   sConfig.Rank = ADC_REGULAR_RANK_1;
   sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
@@ -623,7 +632,7 @@ static void MX_TIM4_Init(void)
 
   /* USER CODE END TIM4_Init 1 */
   htim4.Instance = TIM4;
-  htim4.Init.Prescaler = 71; // IMPORTANT ... <-- Changed from 0 to 71 (72MHz / 72 = 1MHz)
+  htim4.Init.Prescaler = 71; // 72MHz / 72 = 1MHz -> needed for Delay_us()/Read_DHT22() timing
   htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim4.Init.Period = 65535;
   htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -706,21 +715,18 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
 /* USER CODE BEGIN MX_GPIO_Init_2 */
-GPIO_InitTypeDef GPIO_InitStruct = {0};
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
 
-/* Configure Stepper Pulse Pin: PA1 as Output */
-GPIO_InitStruct.Pin = GPIO_PIN_1;
-GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;   // Push-Pull mode to actively drive the line high/low
-GPIO_InitStruct.Pull = GPIO_NOPULL;          // No internal pull-up/pull-down resistors needed
-GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW; // Low speed is perfectly fine for 5ms delays
-HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
+  /* Configure Stepper Pulse Pin: PA1 as Output */
+  GPIO_InitStruct.Pin = GPIO_PIN_1;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;  
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW; 
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
-extern uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len);
-
 void SendFramedPacket(uint8_t type,
                       const uint8_t *payload,
                       uint16_t payload_len)
@@ -744,9 +750,6 @@ void SendFramedPacket(uint8_t type,
 
 void Process_USB_Command(uint8_t *buffer, uint32_t length)
 {
-    // Packet should be:
-    // AA 55 <PwmCommand> <checksum>
-
     if (length < sizeof(PwmCommand) + 3)
         return;
 
@@ -767,12 +770,18 @@ void Process_USB_Command(uint8_t *buffer, uint32_t length)
     switch (cmd.type)
     {
         case TYPE_DC:
-            dc_motor1.target_duty = cmd.duty_cycle;
-            dc_motor1.turn_off_time = HAL_GetTick() + (cmd.duration * 100);
+            if (cmd.pin < NUM_DC_MOTORS)
+            {
+                dc_motors[cmd.pin].target_duty = cmd.duty_cycle;
+                dc_motors[cmd.pin].turn_off_time = HAL_GetTick() + (cmd.duration * 100);
+            }
             break;
 
         case TYPE_SERVO:
-            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, cmd.duty_cycle);
+            if (cmd.pin < NUM_SERVOS)
+            {
+                __HAL_TIM_SET_COMPARE(servo_map[cmd.pin].htim, servo_map[cmd.pin].channel, cmd.duty_cycle);
+            }
             break;
 
         case TYPE_POLAR:
@@ -786,23 +795,23 @@ void Run_Polarimeter_Scan(uint16_t steps) {
     ADC_ChannelConfTypeDef sConfig = {0};
 
     for (uint16_t i = 0; i < steps; i++) {
-        // 1. Pulse stepper pin
+        // Pulse stepper pin
         HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET);
         HAL_Delay(5);
         HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET);
         HAL_Delay(5);
-        
-        // 2. Dynamically switch ADC to Channel 1 (Pin PA1) for the Polarimeter
-        sConfig.Channel = ADC_CHANNEL_1; 
+
+        // Dynamically switch ADC to Channel 5 (Polarimeter Input)
+        sConfig.Channel = ADC_CHANNEL_5;
         sConfig.Rank = ADC_REGULAR_RANK_1;
         sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
         HAL_ADC_ConfigChannel(&hadc1, &sConfig);
 
-        // 3. Read ADC Sample
+        // Read ADC Sample
         HAL_ADC_Start(&hadc1);
         if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
             uint16_t adc_val = HAL_ADC_GetValue(&hadc1);
-            // Save or stream adc_val back via USB here
+            // TODO: store/send adc_val
         }
         HAL_ADC_Stop(&hadc1);
     }
@@ -840,31 +849,31 @@ void Set_Pin_Input(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin) {
 }
 
 void Read_DHT22(float *temperature, float *humidity){
-  uint8_t data[5] = {0, 0, 0, 0, 0};
+    uint8_t data[5] = {0, 0, 0, 0, 0};
     uint8_t i, j;
     uint16_t start_time;
     const uint16_t timeout_us = 200; // 200us safety limit for individual signal phases
 
-    // Host Start Signal
+    // Host Start Signal (PB6 = TIM4_CH1 pin, used here in bit-banged GPIO mode)
     Set_Pin_Output(GPIOB, GPIO_PIN_6);
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
     HAL_Delay(18); // Pull low for 18ms
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
     Delay_us(30);  // Pull high for 30us
-    
+
     // Switch to Input to read DHT response
     Set_Pin_Input(GPIOB, GPIO_PIN_6);
-    
+
     // Wait for DHT response (low 80us then high 80us)
     Delay_us(40);
     if (!(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) == GPIO_PIN_RESET)) return;
-    
+
     // Safety Timeout for initial low phase
     start_time = __HAL_TIM_GET_COUNTER(&htim4);
     while(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) == GPIO_PIN_RESET) {
         if ((uint16_t)(__HAL_TIM_GET_COUNTER(&htim4) - start_time) > timeout_us) return;
     }
-    
+
     // Safety Timeout for initial high phase
     start_time = __HAL_TIM_GET_COUNTER(&htim4);
     while(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) == GPIO_PIN_SET) {
@@ -879,12 +888,12 @@ void Read_DHT22(float *temperature, float *humidity){
             while(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) == GPIO_PIN_RESET) {
                 if ((uint16_t)(__HAL_TIM_GET_COUNTER(&htim4) - start_time) > timeout_us) return;
             }
-            
+
             Delay_us(40); // Check pin state after 40 microseconds
-            
+
             if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) == GPIO_PIN_SET) {
                 data[j] |= (1 << (7 - i)); // It's a '1'
-                
+
                 // Safety Timeout waiting for high data transmission to end
                 start_time = __HAL_TIM_GET_COUNTER(&htim4);
                 while(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) == GPIO_PIN_SET) {
@@ -894,104 +903,41 @@ void Read_DHT22(float *temperature, float *humidity){
         }
     }
 
-    //Check Checksum and Parse
+    // Check Checksum and Parse
     if ((data[0] + data[1] + data[2] + data[3]) == data[4]) {
         short raw_humidity = (data[0] << 8) | data[1];
         short raw_temperature = (data[2] << 8) | data[3];
-        
+
         *humidity = (float)raw_humidity / 10.0f;
         *temperature = (float)raw_temperature / 10.0f;
     }
 }
 
 uint16_t Read_Methane(void) {
-    uint16_t adc_val = 0;
-    ADC_ChannelConfTypeDef sConfig = {0};
-    
-    // Dynamically switch ADC to Channel 0 (Pin PA0) for the Methane Sensor
-    sConfig.Channel = ADC_CHANNEL_0;
-    sConfig.Rank = ADC_REGULAR_RANK_1;
-    sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
-    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
-    
-    // Start the Analog to Digital Conversion
-    HAL_ADC_Start(&hadc1);
-    
-    // Wait for the conversion to finish (10ms timeout)
-    if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
-        adc_val = HAL_ADC_GetValue(&hadc1);
-    }
-    
-    // Stop the ADC to save power / reset state
-    HAL_ADC_Stop(&hadc1);
-    
-    return adc_val;
+    return Read_Analog_Input(ADC_CHANNEL_0);
 }
 
 /**
-  * @brief  Reads the pulse width of a PWM/pulse-based ToF sensor on PB7
-  * @retval Pulse duration in microseconds (1 tick = 1 us)
-  */
-uint16_t Read_ToF_Distance(void) {
-    uint32_t rise_tick = 0;
-    uint32_t fall_tick = 0;
-    const uint32_t timeout_limit = 60000; // Safety breakout threshold, change to 600000 if reads 0 during testing
-    uint32_t timeout_counter = 0;
-
-    // 1. Force state to listen for the Rising Edge
-    __HAL_TIM_SET_CAPTUREPOLARITY(&htim4, TIM_CHANNEL_2, TIM_INPUTCHANNELPOLARITY_RISING);
-    __HAL_TIM_CLEAR_FLAG(&htim4, TIM_FLAG_CC2);
-
-    // 2. Wait for the Rising Edge to strike
-    while (!__HAL_TIM_GET_FLAG(&htim4, TIM_FLAG_CC2)) {
-        if (++timeout_counter > timeout_limit) return 0; // Break if sensor disconnected
-    }
-    rise_tick = HAL_TIM_ReadCapturedValue(&htim4, TIM_CHANNEL_2);
-
-    // 3. Flip polarity immediately to capture the Falling Edge
-    __HAL_TIM_SET_CAPTUREPOLARITY(&htim4, TIM_CHANNEL_2, TIM_INPUTCHANNELPOLARITY_FALLING);
-    __HAL_TIM_CLEAR_FLAG(&htim4, TIM_FLAG_CC2);
-    timeout_counter = 0;
-
-    // 4. Wait for the pulse to drop back to low
-    while (!__HAL_TIM_GET_FLAG(&htim4, TIM_FLAG_CC2)) {
-        if (++timeout_counter > timeout_limit) return 0;
-    }
-    fall_tick = HAL_TIM_ReadCapturedValue(&htim4, TIM_CHANNEL_2);
-
-    // 5. Restore baseline state for the next pass
-    __HAL_TIM_SET_CAPTUREPOLARITY(&htim4, TIM_CHANNEL_2, TIM_INPUTCHANNELPOLARITY_RISING);
-
-    // 6. Handle 16-bit timer overflow calculations cleanly
-    if (fall_tick >= rise_tick) {
-        return (uint16_t)(fall_tick - rise_tick);
-    } else {
-        return (uint16_t)((65535 - rise_tick) + fall_tick + 1);
-    }
-}
-
-/**
-  * @brief  Dynamically reconfigures the ADC to sample a specific cluster channel.
-  * @param  channel: The STM32 HAL Channel definition (e.g., ADC_CHANNEL_4)
+  * @brief  Reads a single ADC1 channel on demand. Used for methane and the
+  *         other misc analog inputs (ADC2/ADC3 per pin doc).
+  * @param  channel: STM32 HAL channel definition (e.g. ADC_CHANNEL_1)
   * @retval 12-bit raw analog conversion value
   */
-uint16_t Read_Secondary_Gas(uint32_t channel) {
+uint16_t Read_Analog_Input(uint32_t channel) {
     uint16_t adc_val = 0;
     ADC_ChannelConfTypeDef sConfig = {0};
-    
-    // Dynamically switch ADC multiplexer to the requested channel
+
     sConfig.Channel = channel;
     sConfig.Rank = ADC_REGULAR_RANK_1;
     sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
     HAL_ADC_ConfigChannel(&hadc1, &sConfig);
-    
-    // Perform standard safe conversion pass
+
     HAL_ADC_Start(&hadc1);
     if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
         adc_val = HAL_ADC_GetValue(&hadc1);
     }
     HAL_ADC_Stop(&hadc1);
-    
+
     return adc_val;
 }
 
@@ -1004,7 +950,6 @@ uint16_t Read_Secondary_Gas(uint32_t channel) {
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
@@ -1023,8 +968,6 @@ void Error_Handler(void)
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */

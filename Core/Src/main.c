@@ -52,7 +52,7 @@ typedef struct
 
 typedef struct
 {
-    uint16_t methane;      // ADC_CHANNEL_0 
+    uint16_t adc1;      // ADC_CHANNEL_0 
     uint16_t co2;
     float temperature;
     float moisture;
@@ -86,12 +86,15 @@ TIM_HandleTypeDef htim4;
 
 UART_HandleTypeDef huart3;
 
-/* USER CODE BEGIN PV */
 // Flags and tracking variables
 uint8_t start_polarimeter_scan = 0;
 uint16_t scan_steps = 0;
 uint32_t last_dht22_read = 0;
-uint32_t last_sensor_send = 0;
+uint32_t last_fast_sensor_read = 0;  
+
+// Cached DHT22 values 
+float cached_temperature = 0.0f;
+float cached_moisture = 0.0f;
 
 #define NUM_DC_MOTORS 6
 #define NUM_SERVOS    4
@@ -122,8 +125,11 @@ static const PwmMap_t servo_map[NUM_SERVOS] = {
 // Motor tracking structure
 typedef struct {
     uint32_t target_duty;
+    uint32_t start_duty;    
     uint32_t current_duty;
-    uint32_t turn_off_time;
+    uint32_t start_time;      
+    uint32_t ramp_end_time;   
+    uint32_t turn_off_time;   
 } DC_Motor_t;
 
 DC_Motor_t dc_motors[NUM_DC_MOTORS] = {0};
@@ -144,7 +150,6 @@ void Process_USB_Command(uint8_t* buffer, uint32_t length);
 void Run_Polarimeter_Scan(uint16_t steps);
 uint16_t Read_CO2_Sensor(void);
 void Read_DHT22(float *temperature, float *humidity);
-uint16_t Read_Methane(void);
 uint16_t Read_Analog_Input(uint32_t channel);
 void SendFramedPacket(uint8_t type, const uint8_t *payload, uint16_t payload_len);
 void Delay_us(uint16_t us);
@@ -219,7 +224,6 @@ int main(void)
 
   // Reset timers
   last_dht22_read = HAL_GetTick();
-  last_sensor_send = HAL_GetTick();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -230,30 +234,45 @@ int main(void)
     /* USER CODE BEGIN 3 */
     uint32_t current_time = HAL_GetTick();
 
-    // Auto-off for DC motors
+    // DC Motor ramping + auto-off (duty computed directly from elapsed time)
     for (int i = 0; i < NUM_DC_MOTORS; i++) {
-        if (dc_motors[i].turn_off_time != 0 && current_time >= dc_motors[i].turn_off_time) {
+        DC_Motor_t *m = &dc_motors[i];
+
+        if (m->turn_off_time == 0) continue; // motor not active
+
+        if ((int32_t)(current_time - m->turn_off_time) >= 0) {
+            // Past hold window -> turn off
             __HAL_TIM_SET_COMPARE(dc_motor_map[i].htim, dc_motor_map[i].channel, 0);
-            dc_motors[i].current_duty = 0;
-            dc_motors[i].target_duty = 0;
-            dc_motors[i].turn_off_time = 0;
+            m->current_duty  = 0;
+            m->target_duty   = 0;
+            m->turn_off_time = 0;
+            continue;
         }
-    }
 
-    // Linear Motor Ramping
-    static uint32_t last_ramp_time = 0;
-    if (current_time - last_ramp_time >= 10) {
-        last_ramp_time = current_time;
-
-        for (int i = 0; i < NUM_DC_MOTORS; i++) {
-            if (dc_motors[i].current_duty < dc_motors[i].target_duty) {
-                dc_motors[i].current_duty++;
-                __HAL_TIM_SET_COMPARE(dc_motor_map[i].htim, dc_motor_map[i].channel, dc_motors[i].current_duty);
-            } else if (dc_motors[i].current_duty > dc_motors[i].target_duty) {
-                dc_motors[i].current_duty--;
-                __HAL_TIM_SET_COMPARE(dc_motor_map[i].htim, dc_motor_map[i].channel, dc_motors[i].current_duty);
+        if ((int32_t)(current_time - m->ramp_end_time) >= 0) {
+            // Ramp finished, holding at target
+            if (m->current_duty != m->target_duty) {
+                m->current_duty = m->target_duty;
+                __HAL_TIM_SET_COMPARE(dc_motor_map[i].htim, dc_motor_map[i].channel, m->current_duty);
             }
+            continue;
         }
+
+        // Mid-ramp: linearly interpolate from start_duty to target_duty
+        uint32_t elapsed  = current_time - m->start_time;
+        uint32_t rampSpan = m->ramp_end_time - m->start_time;
+        int32_t  delta    = (int32_t)m->target_duty - (int32_t)m->start_duty;
+        int32_t  scaled   = m->start_duty + (delta * (int32_t)elapsed) / (int32_t)rampSpan;
+
+        // Clamp so we never overshoot target, regardless of ramp direction
+        if (delta >= 0) {
+            if (scaled > (int32_t)m->target_duty) scaled = m->target_duty;
+        } else {
+            if (scaled < (int32_t)m->target_duty) scaled = m->target_duty;
+        }
+
+        m->current_duty = (uint32_t)scaled;
+        __HAL_TIM_SET_COMPARE(dc_motor_map[i].htim, dc_motor_map[i].channel, m->current_duty);
     }
 
     // Polarimeter
@@ -263,25 +282,32 @@ int main(void)
     }
 
     // Sensor Readings
+    // DHT22 — every 2 seconds (slow sensor, can't be polled faster)
     if (current_time - last_dht22_read >= 2000) {
-      last_dht22_read = current_time;
+        last_dht22_read = current_time;
+        Read_DHT22(&cached_temperature, &cached_moisture);
+    }
 
-      SensorReadings pkt;
+    // Everything else — 10Hz (every 100ms)
+    if (current_time - last_fast_sensor_read >= 100) {
+        last_fast_sensor_read = current_time;
 
-      pkt.methane = Read_Methane();
-      pkt.co2 = Read_CO2_Sensor();
+        SensorReadings pkt;
 
-      // analog inputs
-      pkt.adc2 = Read_Analog_Input(ADC_CHANNEL_1);
-      pkt.adc3 = Read_Analog_Input(ADC_CHANNEL_4);
+        pkt.adc1 = Read_Analog_Input(ADC_CHANNEL_0);
+        pkt.co2  = Read_CO2_Sensor();
+        pkt.adc2 = Read_Analog_Input(ADC_CHANNEL_1);
+        pkt.adc3 = Read_Analog_Input(ADC_CHANNEL_4);
 
-      Read_DHT22(&pkt.temperature, &pkt.moisture);
+        // Reuse the last DHT22 reading rather than re-sampling it
+        pkt.temperature = cached_temperature;
+        pkt.moisture    = cached_moisture;
 
-      SendFramedPacket(
-          TYPE_SENSORS,
-          (uint8_t*)&pkt,
-          sizeof(pkt)
-      );
+        SendFramedPacket(
+            TYPE_SENSORS,
+            (uint8_t*)&pkt,
+            sizeof(pkt)
+        );
     }
   }
   /* USER CODE END 3 */
@@ -306,6 +332,7 @@ void SystemClock_Config(void)
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
   RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
+  /** Initializes the RCC Oscillators according to the specified parameters **/
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
@@ -770,12 +797,19 @@ void Process_USB_Command(uint8_t *buffer, uint32_t length)
     switch (cmd.type)
     {
         case TYPE_DC:
-            if (cmd.pin < NUM_DC_MOTORS)
-            {
-                dc_motors[cmd.pin].target_duty = cmd.duty_cycle;
-                dc_motors[cmd.pin].turn_off_time = HAL_GetTick() + (cmd.duration * 100);
-            }
-            break;
+          if (cmd.pin < NUM_DC_MOTORS)
+          {
+              uint32_t now     = HAL_GetTick();
+              uint32_t rampMs  = (uint32_t)cmd.ramp * 100u;
+              uint32_t holdMs  = (uint32_t)cmd.duration * 100u;
+
+              dc_motors[cmd.pin].start_duty    = dc_motors[cmd.pin].current_duty;
+              dc_motors[cmd.pin].target_duty   = cmd.duty_cycle;
+              dc_motors[cmd.pin].start_time    = now;
+              dc_motors[cmd.pin].ramp_end_time = now + rampMs;
+              dc_motors[cmd.pin].turn_off_time = now + rampMs + holdMs;
+          }
+          break;
 
         case TYPE_SERVO:
             if (cmd.pin < NUM_SERVOS)
@@ -913,9 +947,7 @@ void Read_DHT22(float *temperature, float *humidity){
     }
 }
 
-uint16_t Read_Methane(void) {
-    return Read_Analog_Input(ADC_CHANNEL_0);
-}
+
 
 /**
   * @brief  Reads a single ADC1 channel on demand. Used for methane and the

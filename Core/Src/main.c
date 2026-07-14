@@ -866,32 +866,41 @@ void Set_CO2_Query_Mode(void) {
     HAL_UART_Transmit(&huart3, cmd, 9, 100);
 }
 
+/**
+ * @brief Reads the CO2 concentration from the SC8-CO2 NDIR sensor over USART3.
+ * @note This sensor actively transmits a 16-byte packet every 1 second.
+ * @retval uint16_t CO2 concentration in PPM, or 0 if reading fails.
+ */
 uint16_t Read_CO2_Sensor(void)
 {
-    uint8_t cmd[9] = {0xFF, 0x01, 0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x79};
-    uint8_t resp[9] = {0};
+    uint8_t rx_buf[16];
+    uint16_t co2_ppm = 0;
 
-    HAL_UART_Transmit(&huart3, cmd, 9, 100);
-
-    if (HAL_UART_Receive(&huart3, resp, 9, 200) == HAL_OK)
+    // Read the active 16-byte frame from USART3
+    if (HAL_UART_Receive(&huart3, rx_buf, 16, 1000) == HAL_OK)
     {
-        // Verify start byte (0xFF) and command echo (0x86)
-        if (resp[0] == 0xFF && resp[1] == 0x86) {
-            
-            // Validate Checksum: (Not(Byte1 + Byte2 + ... + Byte7)) + 1
-            uint8_t calculated_cs = 0;
-            for (int i = 1; i < 8; i++) {
-                calculated_cs += resp[i];
+        // 1. Verify the active transmission packet headers (0x42, 0x4D)
+        if (rx_buf[0] == 0x42 && rx_buf[1] == 0x4D)
+        {
+            // 2. Calculate the 8-bit additive checksum over bytes 0 to 14
+            uint8_t calculated_checksum = 0;
+            for (int i = 0; i < 15; i++)
+            {
+                calculated_checksum += rx_buf[i];
             }
-            calculated_cs = (0xFF - calculated_cs) + 1;
 
-            if (resp[8] == calculated_cs) {
-                return (resp[2] << 8) | resp[3]; // Checksum passes, return data!
+            // 3. Verify the computed checksum matches the packet's trailing byte
+            if (calculated_checksum == rx_buf[15])
+            {
+                // 4. Extract CO2 PPM (BYTE 6 is High Byte, BYTE 7 is Low Byte)
+                co2_ppm = ((uint16_t)rx_buf[6] << 8) | rx_buf[7];
+                return co2_ppm;
             }
         }
     }
 
-    return 0; // Return 0 as a safe fallback if timeout, wrong headers, or checksum fails
+    // Return 0 if the frame times out, headers mismatch, or the checksum fails
+    return 0;
 }
 
 void Set_Pin_Output(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin) {

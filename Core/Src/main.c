@@ -93,11 +93,15 @@ UART_HandleTypeDef huart3;
 uint8_t start_polarimeter_scan = 0;
 //uint16_t scan_steps = 0;
 uint32_t last_dht22_read = 0;
-uint32_t last_fast_sensor_read = 0;  
+uint32_t last_fast_sensor_read = 0; 
+uint32_t last_co2_read = 0; 
 
 // Cached DHT22 values 
 float cached_temperature = 0.0f;
 float cached_moisture = 0.0f;
+
+// Cached CO2 value
+uint16_t cached_co2 = 0;
 
 #define NUM_DC_MOTORS 6
 #define NUM_SERVOS    4
@@ -231,25 +235,23 @@ int main(void)
 
   // Reset timers
   last_dht22_read = HAL_GetTick();
+  last_co2_read   = HAL_GetTick();
   
   /* USER CODE END 2 */
 
   /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
   while (1)
-  {
-    /* USER CODE END WHILE */
-    /* USER CODE BEGIN 3 */
+{
+    /* USER CODE BEGIN WHILE */
     uint32_t current_time = HAL_GetTick();
 
     // DC Motor ramping + auto-off (duty computed directly from elapsed time)
     for (int i = 0; i < NUM_DC_MOTORS; i++) {
         DC_Motor_t *m = &dc_motors[i];
 
-        if (m->turn_off_time == 0) continue; // motor not active
+        if (m->turn_off_time == 0) continue;
 
         if ((int32_t)(current_time - m->turn_off_time) >= 0) {
-            // Past hold window -> turn off
             __HAL_TIM_SET_COMPARE(dc_motor_map[i].htim, dc_motor_map[i].channel, 0);
             m->current_duty  = 0;
             m->target_duty   = 0;
@@ -258,7 +260,6 @@ int main(void)
         }
 
         if ((int32_t)(current_time - m->ramp_end_time) >= 0) {
-            // Ramp finished, holding at target
             if (m->current_duty != m->target_duty) {
                 m->current_duty = m->target_duty;
                 __HAL_TIM_SET_COMPARE(dc_motor_map[i].htim, dc_motor_map[i].channel, m->current_duty);
@@ -266,13 +267,11 @@ int main(void)
             continue;
         }
 
-        // Mid-ramp: linearly interpolate from start_duty to target_duty
         uint32_t elapsed  = current_time - m->start_time;
         uint32_t rampSpan = m->ramp_end_time - m->start_time;
         int32_t  delta    = (int32_t)m->target_duty - (int32_t)m->start_duty;
         int32_t  scaled   = m->start_duty + (delta * (int32_t)elapsed) / (int32_t)rampSpan;
 
-        // Clamp so we never overshoot target, regardless of ramp direction
         if (delta >= 0) {
             if (scaled > (int32_t)m->target_duty) scaled = m->target_duty;
         } else {
@@ -286,37 +285,37 @@ int main(void)
     // Polarimeter
     if (start_polarimeter_scan) {
         Run_Polarimeter_Scan();
-        start_polarimeter_scan = 0; // Clear flag when finished
+        start_polarimeter_scan = 0;
     }
 
     // Sensor Readings
-    // DHT22 — every 2 seconds (slow sensor, can't be polled faster)
     if (current_time - last_dht22_read >= 2000) {
         last_dht22_read = current_time;
         Read_DHT22(&cached_temperature, &cached_moisture);
     }
 
-    // Everything else — 10Hz (every 100ms)
+    // CO2
+    if (current_time - last_co2_read >= 1000) {
+        last_co2_read = current_time;
+        cached_co2 = Read_CO2_Sensor();
+    }
+
     if (current_time - last_fast_sensor_read >= 100) {
         last_fast_sensor_read = current_time;
 
         SensorReadings pkt;
-
         pkt.adc1 = Read_Analog_Input(ADC_CHANNEL_0);
-        pkt.co2  = Read_CO2_Sensor();
+        pkt.co2  = cached_co2;
         pkt.adc2 = Read_Analog_Input(ADC_CHANNEL_1);
         pkt.adc3 = Read_Analog_Input(ADC_CHANNEL_4);
-
-        // Reuse the last DHT22 reading rather than re-sampling it
         pkt.temperature = cached_temperature;
         pkt.moisture    = cached_moisture;
 
-        SendFramedPacket(
-            TYPE_SENSORS,
-            (uint8_t*)&pkt,
-            sizeof(pkt)
-        );
+        SendFramedPacket(TYPE_SENSORS, (uint8_t*)&pkt, sizeof(pkt));
     }
+
+    /* USER CODE END WHILE */
+    /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
 }
@@ -340,7 +339,7 @@ void SystemClock_Config(void)
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
   RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
-  /** Initializes the RCC Oscillators according to the specified parameters **/
+/** Initializes the RCC Oscillators according to the specified parameters in the RCC_OscInitTypeDef structure.*/
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;

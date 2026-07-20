@@ -79,6 +79,8 @@ void Error_Handler(void);
 #define SERVO3_GPIO_Port GPIOB
 #define SERVO4_Pin GPIO_PIN_1
 #define SERVO4_GPIO_Port GPIOB
+#define LED_Pin GPIO_PIN_14
+#define LED_GPIO_Port GPIOB
 #define MOTOR1_Pin GPIO_PIN_8
 #define MOTOR1_GPIO_Port GPIOA
 #define MOTOR2_Pin GPIO_PIN_9
@@ -89,6 +91,14 @@ void Error_Handler(void);
 #define MOTOR4_GPIO_Port GPIOA
 #define MOTOR5_Pin GPIO_PIN_3
 #define MOTOR5_GPIO_Port GPIOB
+#define DIR_Pin GPIO_PIN_4
+#define DIR_GPIO_Port GPIOB
+#define STEP_Pin GPIO_PIN_5
+#define STEP_GPIO_Port GPIOB
+#define TEMP_Pin GPIO_PIN_6
+#define TEMP_GPIO_Port GPIOB
+#define TOF_Pin GPIO_PIN_7
+#define TOF_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 

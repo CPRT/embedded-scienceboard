@@ -28,11 +28,44 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+#define MAGIC0 0xAA
+#define MAGIC1 0x55
+
+#define TYPE_DC     0x00
+#define TYPE_SERVO  0x01
+#define TYPE_POLAR  0x02
+
+#define TYPE_SENSORS 0x01
+#define TYPE_POLAR_DATA 0x02
+
+#pragma pack(push,1)
+
+typedef struct
+{
+    uint8_t pin;
+    uint8_t type;
+    uint16_t duty_cycle;
+    uint16_t duration;
+    uint16_t ramp;   
+} PwmCommand;
+
+typedef struct
+{
+    uint16_t adc1;      // ADC_CHANNEL_0 
+    uint16_t co2;
+    float temperature;
+    float moisture;
+    uint16_t adc2;         // ADC_CHANNEL_1 
+    uint16_t adc3;         // ADC_CHANNEL_4 
+} SensorReadings;
+
+#pragma pack(pop)
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define SCAN_STEPS 48
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -54,6 +87,58 @@ UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
 
+// Flags and tracking variables
+uint8_t start_polarimeter_scan = 0;
+//uint16_t scan_steps = 0;
+uint32_t last_dht22_read = 0;
+uint32_t last_fast_sensor_read = 0;
+uint32_t last_co2_read = 0;
+
+// Cached DHT22 values
+float cached_temperature = 0.0f;
+float cached_moisture = 0.0f;
+
+// Cached CO2 value
+uint16_t cached_co2 = 0;
+
+#define NUM_DC_MOTORS 7
+#define NUM_SERVOS    4
+
+typedef struct {
+    TIM_HandleTypeDef *htim;
+    uint32_t channel;
+} PwmMap_t;
+
+// timer, channel for DC motors (Motor 1-3 on TIM1, Motor 4-6 on TIM2)
+static const PwmMap_t dc_motor_map[NUM_DC_MOTORS] = {
+    { &htim1, TIM_CHANNEL_1 },  // Motor 1
+    { &htim1, TIM_CHANNEL_2 },  // Motor 2
+    { &htim1, TIM_CHANNEL_3 },  // Motor 3
+    { &htim2, TIM_CHANNEL_1 },  // Motor 4
+    { &htim2, TIM_CHANNEL_2 },  // Motor 5
+    { &htim2, TIM_CHANNEL_3 },  // Motor 6
+    { &htim2, TIM_CHANNEL_4 }   // Heater
+};
+
+// timer, channel for servos
+static const PwmMap_t servo_map[NUM_SERVOS] = {
+    { &htim3, TIM_CHANNEL_1 },
+    { &htim3, TIM_CHANNEL_2 },
+    { &htim3, TIM_CHANNEL_3 },
+    { &htim3, TIM_CHANNEL_4 }
+};
+
+// Motor tracking structure
+typedef struct {
+    uint32_t target_duty;
+    uint32_t start_duty;
+    uint32_t current_duty;
+    uint32_t start_time;
+    uint32_t ramp_end_time;
+    uint32_t turn_off_time;
+} DC_Motor_t;
+
+DC_Motor_t dc_motors[NUM_DC_MOTORS] = {0};
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -68,11 +153,34 @@ static void MX_TIM4_Init(void);
 static void MX_USART3_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
+void Process_USB_Command(uint8_t* buffer, uint32_t length);
+void Run_Polarimeter_Scan(void);
+uint16_t Read_CO2_Sensor(void);
+void Read_DHT22(float *temperature, float *humidity);
+uint16_t Read_Analog_Input(uint32_t channel);
+void SendFramedPacket(uint8_t type, const uint8_t *payload, uint16_t payload_len);
+void Delay_us(uint16_t us);
+void Set_CO2_Query_Mode(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+uint8_t CalcChecksum(const uint8_t *data, uint32_t len)
+{
+    uint8_t checksum = 0;
 
+    for(uint32_t i = 0; i < len; i++)
+    {
+        checksum ^= data[i];
+    }
+
+    return checksum;
+}
+
+void Delay_us(uint16_t us) {
+    uint16_t start = __HAL_TIM_GET_COUNTER(&htim4);
+    while ((uint16_t)(__HAL_TIM_GET_COUNTER(&htim4) - start) < us);
+}
 /* USER CODE END 0 */
 
 /**
@@ -114,12 +222,98 @@ int main(void)
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
 
+  for (int i = 0; i < NUM_DC_MOTORS; i++) {
+      HAL_TIM_PWM_Start(dc_motor_map[i].htim, dc_motor_map[i].channel);
+  }
+
+  for (int i = 0; i < NUM_SERVOS; i++) {
+      HAL_TIM_PWM_Start(servo_map[i].htim, servo_map[i].channel);
+  }
+
+  // Free-running 1MHz counter on TIM4, used by Delay_us() and Read_DHT22()'s timeouts
+  HAL_TIM_Base_Start(&htim4);
+
+  // Reset timers
+  last_dht22_read = HAL_GetTick();
+  last_co2_read   = HAL_GetTick();
+  
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    uint32_t current_time = HAL_GetTick();
+
+    // DC Motor ramping + auto-off (duty computed directly from elapsed time)
+    for (int i = 0; i < NUM_DC_MOTORS; i++) {
+        DC_Motor_t *m = &dc_motors[i];
+
+        if (m->turn_off_time == 0) continue;
+
+        if ((int32_t)(current_time - m->turn_off_time) >= 0) {
+            __HAL_TIM_SET_COMPARE(dc_motor_map[i].htim, dc_motor_map[i].channel, 0);
+            m->current_duty  = 0;
+            m->target_duty   = 0;
+            m->turn_off_time = 0;
+            continue;
+        }
+
+        if ((int32_t)(current_time - m->ramp_end_time) >= 0) {
+            if (m->current_duty != m->target_duty) {
+                m->current_duty = m->target_duty;
+                __HAL_TIM_SET_COMPARE(dc_motor_map[i].htim, dc_motor_map[i].channel, m->current_duty);
+            }
+            continue;
+        }
+
+        uint32_t elapsed  = current_time - m->start_time;
+        uint32_t rampSpan = m->ramp_end_time - m->start_time;
+        int32_t  delta    = (int32_t)m->target_duty - (int32_t)m->start_duty;
+        int32_t  scaled   = m->start_duty + (delta * (int32_t)elapsed) / (int32_t)rampSpan;
+
+        if (delta >= 0) {
+            if (scaled > (int32_t)m->target_duty) scaled = m->target_duty;
+        } else {
+            if (scaled < (int32_t)m->target_duty) scaled = m->target_duty;
+        }
+
+        m->current_duty = (uint32_t)scaled;
+        __HAL_TIM_SET_COMPARE(dc_motor_map[i].htim, dc_motor_map[i].channel, m->current_duty);
+    }
+
+    // Polarimeter
+    if (start_polarimeter_scan) {
+        Run_Polarimeter_Scan();
+        start_polarimeter_scan = 0;
+    }
+
+    // Sensor Readings
+    if (current_time - last_dht22_read >= 2000) {
+        last_dht22_read = current_time;
+        Read_DHT22(&cached_temperature, &cached_moisture);
+    }
+
+    // CO2
+    if (current_time - last_co2_read >= 1000) {
+        last_co2_read = current_time;
+        cached_co2 = Read_CO2_Sensor();
+    }
+
+    if (current_time - last_fast_sensor_read >= 100) {
+        last_fast_sensor_read = current_time;
+
+        SensorReadings pkt;
+        pkt.adc1 = Read_Analog_Input(ADC_CHANNEL_0);
+        pkt.co2  = cached_co2;
+        pkt.adc2 = Read_Analog_Input(ADC_CHANNEL_1);
+        pkt.adc3 = Read_Analog_Input(ADC_CHANNEL_4);
+        pkt.temperature = cached_temperature;
+        pkt.moisture    = cached_moisture;
+
+        SendFramedPacket(TYPE_SENSORS, (uint8_t*)&pkt, sizeof(pkt));
+    }
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -237,7 +431,7 @@ static void MX_CAN_Init(void)
 
   /* USER CODE END CAN_Init 1 */
   hcan.Instance = CAN1;
-  hcan.Init.Prescaler = 16;
+  hcan.Init.Prescaler = 8;
   hcan.Init.Mode = CAN_MODE_NORMAL;
   hcan.Init.SyncJumpWidth = CAN_SJW_1TQ;
   hcan.Init.TimeSeg1 = CAN_BS1_1TQ;
@@ -472,7 +666,7 @@ static void MX_TIM4_Init(void)
 
   /* USER CODE END TIM4_Init 1 */
   htim4.Instance = TIM4;
-  htim4.Init.Prescaler = 0;
+  htim4.Init.Prescaler = 48-1;
   htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim4.Init.Period = 65535;
   htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -546,6 +740,7 @@ static void MX_USART3_UART_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
 /* USER CODE BEGIN MX_GPIO_Init_1 */
 /* USER CODE END MX_GPIO_Init_1 */
 
@@ -554,11 +749,253 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, LED_Pin|DIR_Pin|STEP_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pins : LED_Pin DIR_Pin STEP_Pin */
+  GPIO_InitStruct.Pin = LED_Pin|DIR_Pin|STEP_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
 /* USER CODE BEGIN MX_GPIO_Init_2 */
 /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
+
+void SendFramedPacket(uint8_t type,
+                      const uint8_t *payload,
+                      uint16_t payload_len)
+{
+    uint8_t packet[64];
+
+    if(payload_len + 4 > sizeof(packet))
+        return;
+
+    packet[0] = MAGIC0;
+    packet[1] = MAGIC1;
+    packet[2] = type;
+
+    memcpy(&packet[3], payload, payload_len);
+
+    packet[3 + payload_len] =
+        CalcChecksum(payload, payload_len);
+
+    CDC_Transmit_FS(packet, payload_len + 4);
+}
+
+void Process_USB_Command(uint8_t *buffer, uint32_t length)
+{
+    if (length < sizeof(PwmCommand) + 3)
+        return;
+
+    // Verify header
+    if (buffer[0] != MAGIC0 || buffer[1] != MAGIC1)
+        return;
+
+    // Verify checksum
+    uint8_t checksum = CalcChecksum(&buffer[2], sizeof(PwmCommand));
+
+    if (checksum != buffer[2 + sizeof(PwmCommand)])
+        return;
+
+    // Extract command
+    PwmCommand cmd;
+    memcpy(&cmd, &buffer[2], sizeof(PwmCommand));
+
+    switch (cmd.type)
+    {
+        case TYPE_DC:
+          if (cmd.pin < NUM_DC_MOTORS)
+          {
+              uint32_t now     = HAL_GetTick();
+              uint32_t rampMs  = (uint32_t)cmd.ramp * 100u;
+              uint32_t holdMs  = (uint32_t)cmd.duration * 100u;
+
+              dc_motors[cmd.pin].start_duty    = dc_motors[cmd.pin].current_duty;
+              dc_motors[cmd.pin].target_duty   = cmd.duty_cycle;
+              dc_motors[cmd.pin].start_time    = now;
+              dc_motors[cmd.pin].ramp_end_time = now + rampMs;
+              dc_motors[cmd.pin].turn_off_time = now + rampMs + holdMs;
+          }
+          break;
+
+        case TYPE_SERVO:
+            if (cmd.pin < NUM_SERVOS)
+            {
+                __HAL_TIM_SET_COMPARE(servo_map[cmd.pin].htim, servo_map[cmd.pin].channel, cmd.duty_cycle);
+            }
+            break;
+
+        case TYPE_POLAR:
+            start_polarimeter_scan = 1;
+            break;
+    }
+}
+
+void Run_Polarimeter_Scan(void) {
+    ADC_ChannelConfTypeDef sConfig = {0};
+    uint16_t sample_buf[SCAN_STEPS];
+
+    sConfig.Channel = ADC_CHANNEL_5;
+    sConfig.Rank = ADC_REGULAR_RANK_1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
+    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+
+    for (uint16_t i = 0; i < SCAN_STEPS; i++) {
+        HAL_GPIO_WritePin(STEP_GPIO_Port, STEP_Pin, GPIO_PIN_SET);
+        HAL_Delay(5);
+        HAL_GPIO_WritePin(STEP_GPIO_Port, STEP_Pin, GPIO_PIN_RESET);
+        HAL_Delay(5);
+
+        // Read ADC Sample
+        HAL_ADC_Start(&hadc1);
+        if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
+            sample_buf[i] = (uint16_t)HAL_ADC_GetValue(&hadc1);
+        } else {
+            sample_buf[i] = 0xFFFF;
+        }
+        HAL_ADC_Stop(&hadc1);
+    }
+
+    SendFramedPacket(
+        TYPE_POLAR_DATA,
+        (uint8_t*)sample_buf,
+        sizeof(sample_buf)
+    );
+}
+
+uint16_t Read_CO2_Sensor(void)
+{
+    uint8_t rx_buf[16];
+    uint16_t co2_ppm = 0;
+
+    // Read the active 16-byte frame from USART3
+    if (HAL_UART_Receive(&huart3, rx_buf, 16, 1000) == HAL_OK)
+    {
+        // 1. Verify the active transmission packet headers (0x42, 0x4D)
+        if (rx_buf[0] == 0x42 && rx_buf[1] == 0x4D)
+        {
+            // 2. Calculate the 8-bit additive checksum over bytes 0 to 14
+            uint8_t calculated_checksum = 0;
+            for (int i = 0; i < 15; i++)
+            {
+                calculated_checksum += rx_buf[i];
+            }
+
+            // 3. Verify the computed checksum matches the packet's trailing byte
+            if (calculated_checksum == rx_buf[15])
+            {
+                // 4. Extract CO2 PPM (BYTE 6 is High Byte, BYTE 7 is Low Byte)
+                co2_ppm = ((uint16_t)rx_buf[6] << 8) | rx_buf[7];
+                return co2_ppm;
+            }
+        }
+    }
+
+    return 0;
+}
+
+void Set_Pin_Output(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin) {
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(GPIOx, &GPIO_InitStruct);
+}
+
+void Set_Pin_Input(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin) {
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOx, &GPIO_InitStruct);
+}
+
+void Read_DHT22(float *temperature, float *humidity){
+    uint8_t data[5] = {0, 0, 0, 0, 0};
+    uint8_t i, j;
+    uint16_t start_time;
+    const uint16_t timeout_us = 200; // 200us safety limit for individual signal phases
+
+    // Host Start Signal (PB6 = TIM4_CH1 pin, used here in bit-banged GPIO mode)
+    Set_Pin_Output(GPIOB, GPIO_PIN_6);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
+    HAL_Delay(18); // Pull low for 18ms
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+    Delay_us(30);  // Pull high for 30us
+
+    // Switch to Input to read DHT response
+    Set_Pin_Input(GPIOB, GPIO_PIN_6);
+
+    // Wait for DHT response (low 80us then high 80us)
+    Delay_us(40);
+    if (!(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) == GPIO_PIN_RESET)) return;
+
+    // Safety Timeout for initial low phase
+    start_time = __HAL_TIM_GET_COUNTER(&htim4);
+    while(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) == GPIO_PIN_RESET) {
+        if ((uint16_t)(__HAL_TIM_GET_COUNTER(&htim4) - start_time) > timeout_us) return;
+    }
+
+    // Safety Timeout for initial high phase
+    start_time = __HAL_TIM_GET_COUNTER(&htim4);
+    while(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) == GPIO_PIN_SET) {
+        if ((uint16_t)(__HAL_TIM_GET_COUNTER(&htim4) - start_time) > timeout_us) return;
+    }
+
+    // Read 40 bits = 5 bytes
+    for (j = 0; j < 5; j++) {
+        for (i = 0; i < 8; i++) {
+            // Safety Timeout waiting for low bit preamble to end (pin goes high)
+            start_time = __HAL_TIM_GET_COUNTER(&htim4);
+            while(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) == GPIO_PIN_RESET) {
+                if ((uint16_t)(__HAL_TIM_GET_COUNTER(&htim4) - start_time) > timeout_us) return;
+            }
+
+            Delay_us(40); // Check pin state after 40 microseconds
+
+            if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) == GPIO_PIN_SET) {
+                data[j] |= (1 << (7 - i)); // It's a '1'
+
+                // Safety Timeout waiting for high data transmission to end
+                start_time = __HAL_TIM_GET_COUNTER(&htim4);
+                while(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) == GPIO_PIN_SET) {
+                    if ((uint16_t)(__HAL_TIM_GET_COUNTER(&htim4) - start_time) > timeout_us) return;
+                }
+            }
+        }
+    }
+
+    // Check Checksum and Parse
+    if ((data[0] + data[1] + data[2] + data[3]) == data[4]) {
+        short raw_humidity = (data[0] << 8) | data[1];
+        short raw_temperature = (data[2] << 8) | data[3];
+
+        *humidity = (float)raw_humidity / 10.0f;
+        *temperature = (float)raw_temperature / 10.0f;
+    }
+}
+
+uint16_t Read_Analog_Input(uint32_t channel) {
+    uint16_t adc_val = 0;
+    ADC_ChannelConfTypeDef sConfig = {0};
+
+    sConfig.Channel = channel;
+    sConfig.Rank = ADC_REGULAR_RANK_1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
+    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+
+    HAL_ADC_Start(&hadc1);
+    if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
+        adc_val = HAL_ADC_GetValue(&hadc1);
+    }
+    HAL_ADC_Stop(&hadc1);
+
+    return adc_val;
+}
 
 /* USER CODE END 4 */
 

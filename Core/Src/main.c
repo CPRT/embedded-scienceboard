@@ -19,8 +19,6 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "usb_device.h"
-#include "usbd_cdc_if.h"
-#include <string.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -38,9 +36,7 @@
 #define TYPE_POLAR  0x02
 
 #define TYPE_SENSORS 0x01
-#define TYPE_POLAR_DATA 0x02  
-#define POLAR_SAMPLES_PER_CHUNK 30  
-
+#define TYPE_POLAR_DATA 0x02
 
 #pragma pack(push,1)
 
@@ -89,21 +85,23 @@ TIM_HandleTypeDef htim4;
 
 UART_HandleTypeDef huart3;
 
+/* USER CODE BEGIN PV */
+
 // Flags and tracking variables
 uint8_t start_polarimeter_scan = 0;
 //uint16_t scan_steps = 0;
 uint32_t last_dht22_read = 0;
-uint32_t last_fast_sensor_read = 0; 
-uint32_t last_co2_read = 0; 
+uint32_t last_fast_sensor_read = 0;
+uint32_t last_co2_read = 0;
 
-// Cached DHT22 values 
+// Cached DHT22 values
 float cached_temperature = 0.0f;
 float cached_moisture = 0.0f;
 
 // Cached CO2 value
 uint16_t cached_co2 = 0;
 
-#define NUM_DC_MOTORS 6
+#define NUM_DC_MOTORS 7
 #define NUM_SERVOS    4
 
 typedef struct {
@@ -119,6 +117,7 @@ static const PwmMap_t dc_motor_map[NUM_DC_MOTORS] = {
     { &htim2, TIM_CHANNEL_1 },  // Motor 4
     { &htim2, TIM_CHANNEL_2 },  // Motor 5
     { &htim2, TIM_CHANNEL_3 },  // Motor 6
+    { &htim2, TIM_CHANNEL_4 }   // Heater
 };
 
 // timer, channel for servos
@@ -126,17 +125,17 @@ static const PwmMap_t servo_map[NUM_SERVOS] = {
     { &htim3, TIM_CHANNEL_1 },
     { &htim3, TIM_CHANNEL_2 },
     { &htim3, TIM_CHANNEL_3 },
-    { &htim3, TIM_CHANNEL_4 },
+    { &htim3, TIM_CHANNEL_4 }
 };
 
 // Motor tracking structure
 typedef struct {
     uint32_t target_duty;
-    uint32_t start_duty;    
+    uint32_t start_duty;
     uint32_t current_duty;
-    uint32_t start_time;      
-    uint32_t ramp_end_time;   
-    uint32_t turn_off_time;   
+    uint32_t start_time;
+    uint32_t ramp_end_time;
+    uint32_t turn_off_time;
 } DC_Motor_t;
 
 DC_Motor_t dc_motors[NUM_DC_MOTORS] = {0};
@@ -153,6 +152,7 @@ static void MX_TIM3_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_USART3_UART_Init(void);
 /* USER CODE BEGIN PFP */
+
 void Process_USB_Command(uint8_t* buffer, uint32_t length);
 void Run_Polarimeter_Scan(void);
 uint16_t Read_CO2_Sensor(void);
@@ -175,6 +175,11 @@ uint8_t CalcChecksum(const uint8_t *data, uint32_t len)
     }
 
     return checksum;
+}
+
+void Delay_us(uint16_t us) {
+    uint16_t start = __HAL_TIM_GET_COUNTER(&htim4);
+    while ((uint16_t)(__HAL_TIM_GET_COUNTER(&htim4) - start) < us);
 }
 /* USER CODE END 0 */
 
@@ -215,23 +220,18 @@ int main(void)
   MX_TIM4_Init();
   MX_USART3_UART_Init();
   MX_USB_DEVICE_Init();
-
   /* USER CODE BEGIN 2 */
-  // Start PWM output on every mapped DC motor channel
+
   for (int i = 0; i < NUM_DC_MOTORS; i++) {
       HAL_TIM_PWM_Start(dc_motor_map[i].htim, dc_motor_map[i].channel);
   }
 
-  // Start PWM output on every mapped servo channel
   for (int i = 0; i < NUM_SERVOS; i++) {
       HAL_TIM_PWM_Start(servo_map[i].htim, servo_map[i].channel);
   }
 
   // Free-running 1MHz counter on TIM4, used by Delay_us() and Read_DHT22()'s timeouts
   HAL_TIM_Base_Start(&htim4);
-
-  // Set CO2 Sensor to passive Query Mode
-  Set_CO2_Query_Mode();
 
   // Reset timers
   last_dht22_read = HAL_GetTick();
@@ -240,9 +240,9 @@ int main(void)
   /* USER CODE END 2 */
 
   /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
   while (1)
-{
-    /* USER CODE BEGIN WHILE */
+  {
     uint32_t current_time = HAL_GetTick();
 
     // DC Motor ramping + auto-off (duty computed directly from elapsed time)
@@ -315,18 +315,10 @@ int main(void)
     }
 
     /* USER CODE END WHILE */
+
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
-}
-
-/**
-  * @brief microsecond helper function
-  * @retval uint16_t for delay amount
-  */
-void Delay_us(uint16_t us) {
-    uint16_t start = __HAL_TIM_GET_COUNTER(&htim4);
-    while ((uint16_t)(__HAL_TIM_GET_COUNTER(&htim4) - start) < us);
 }
 
 /**
@@ -339,7 +331,9 @@ void SystemClock_Config(void)
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
   RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
-/** Initializes the RCC Oscillators according to the specified parameters in the RCC_OscInitTypeDef structure.*/
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
@@ -352,6 +346,8 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
@@ -390,6 +386,8 @@ static void MX_ADC1_Init(void)
 
   /* USER CODE END ADC1_Init 1 */
 
+  /** Common config
+  */
   hadc1.Instance = ADC1;
   hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
   hadc1.Init.ContinuousConvMode = DISABLE;
@@ -402,6 +400,8 @@ static void MX_ADC1_Init(void)
     Error_Handler();
   }
 
+  /** Configure Regular Channel
+  */
   sConfig.Channel = ADC_CHANNEL_0;
   sConfig.Rank = ADC_REGULAR_RANK_1;
   sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
@@ -431,7 +431,7 @@ static void MX_CAN_Init(void)
 
   /* USER CODE END CAN_Init 1 */
   hcan.Instance = CAN1;
-  hcan.Init.Prescaler = 16;
+  hcan.Init.Prescaler = 8;
   hcan.Init.Mode = CAN_MODE_NORMAL;
   hcan.Init.SyncJumpWidth = CAN_SJW_1TQ;
   hcan.Init.TimeSeg1 = CAN_BS1_1TQ;
@@ -666,7 +666,7 @@ static void MX_TIM4_Init(void)
 
   /* USER CODE END TIM4_Init 1 */
   htim4.Instance = TIM4;
-  htim4.Init.Prescaler = 71; // 72MHz / 72 = 1MHz -> needed for Delay_us()/Read_DHT22() timing
+  htim4.Init.Prescaler = 48-1;
   htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim4.Init.Period = 65535;
   htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -740,6 +740,7 @@ static void MX_USART3_UART_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
 /* USER CODE BEGIN MX_GPIO_Init_1 */
 /* USER CODE END MX_GPIO_Init_1 */
 
@@ -748,11 +749,22 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, LED_Pin|DIR_Pin|STEP_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pins : LED_Pin DIR_Pin STEP_Pin */
+  GPIO_InitStruct.Pin = LED_Pin|DIR_Pin|STEP_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
 /* USER CODE BEGIN MX_GPIO_Init_2 */
 /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
+
 void SendFramedPacket(uint8_t type,
                       const uint8_t *payload,
                       uint16_t payload_len)
@@ -818,7 +830,6 @@ void Process_USB_Command(uint8_t *buffer, uint32_t length)
             break;
 
         case TYPE_POLAR:
-            //scan_steps = cmd.duration;
             start_polarimeter_scan = 1;
             break;
     }
@@ -826,16 +837,14 @@ void Process_USB_Command(uint8_t *buffer, uint32_t length)
 
 void Run_Polarimeter_Scan(void) {
     ADC_ChannelConfTypeDef sConfig = {0};
-    uint16_t sample_buf[SCAN_STEPS]; // Holds all 48 samples
+    uint16_t sample_buf[SCAN_STEPS];
 
-    // Configure ADC to Channel 5 (Polarimeter Input) once before the scan starts
     sConfig.Channel = ADC_CHANNEL_5;
     sConfig.Rank = ADC_REGULAR_RANK_1;
     sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
     HAL_ADC_ConfigChannel(&hadc1, &sConfig);
 
     for (uint16_t i = 0; i < SCAN_STEPS; i++) {
-        // Pulse stepper pin using autogenerated labels
         HAL_GPIO_WritePin(STEP_GPIO_Port, STEP_Pin, GPIO_PIN_SET);
         HAL_Delay(5);
         HAL_GPIO_WritePin(STEP_GPIO_Port, STEP_Pin, GPIO_PIN_RESET);
@@ -846,12 +855,11 @@ void Run_Polarimeter_Scan(void) {
         if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
             sample_buf[i] = (uint16_t)HAL_ADC_GetValue(&hadc1);
         } else {
-            sample_buf[i] = 0xFFFF; // Sentinel for failed read
+            sample_buf[i] = 0xFFFF;
         }
         HAL_ADC_Stop(&hadc1);
     }
 
-    // Send all 48 samples in a single packet
     SendFramedPacket(
         TYPE_POLAR_DATA,
         (uint8_t*)sample_buf,
@@ -859,17 +867,6 @@ void Run_Polarimeter_Scan(void) {
     );
 }
 
-void Set_CO2_Query_Mode(void) {
-    // Command to switch sensor transmission mode to Passive/Q&A
-    uint8_t cmd[9] = {0xFF, 0x01, 0x78, 0x41, 0x00, 0x00, 0x00, 0x00, 0x46};
-    HAL_UART_Transmit(&huart3, cmd, 9, 100);
-}
-
-/**
- * @brief Reads the CO2 concentration from the SC8-CO2 NDIR sensor over USART3.
- * @note This sensor actively transmits a 16-byte packet every 1 second.
- * @retval uint16_t CO2 concentration in PPM, or 0 if reading fails.
- */
 uint16_t Read_CO2_Sensor(void)
 {
     uint8_t rx_buf[16];
@@ -898,7 +895,6 @@ uint16_t Read_CO2_Sensor(void)
         }
     }
 
-    // Return 0 if the frame times out, headers mismatch, or the checksum fails
     return 0;
 }
 
@@ -983,14 +979,6 @@ void Read_DHT22(float *temperature, float *humidity){
     }
 }
 
-
-
-/**
-  * @brief  Reads a single ADC1 channel on demand. Used for methane and the
-  *         other misc analog inputs (ADC2/ADC3 per pin doc).
-  * @param  channel: STM32 HAL channel definition (e.g. ADC_CHANNEL_1)
-  * @retval 12-bit raw analog conversion value
-  */
 uint16_t Read_Analog_Input(uint32_t channel) {
     uint16_t adc_val = 0;
     ADC_ChannelConfTypeDef sConfig = {0};
@@ -1018,6 +1006,7 @@ uint16_t Read_Analog_Input(uint32_t channel) {
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
@@ -1036,6 +1025,8 @@ void Error_Handler(void)
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */

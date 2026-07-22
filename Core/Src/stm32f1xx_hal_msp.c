@@ -174,7 +174,7 @@ void HAL_CAN_MspInit(CAN_HandleTypeDef* hcan)
     */
     GPIO_InitStruct.Pin = GPIO_PIN_8;
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
     GPIO_InitStruct.Pin = GPIO_PIN_9;
@@ -218,14 +218,7 @@ void HAL_CAN_MspDeInit(CAN_HandleTypeDef* hcan)
     HAL_GPIO_DeInit(GPIOB, GPIO_PIN_8|GPIO_PIN_9);
 
     /* CAN1 interrupt DeInit */
-  /* USER CODE BEGIN CAN1:USB_LP_CAN1_RX0_IRQn disable */
-    /**
-    * Uncomment the line below to disable the "USB_LP_CAN1_RX0_IRQn" interrupt
-    * Be aware, disabling shared interrupt may affect other IPs
-    */
-    /* HAL_NVIC_DisableIRQ(USB_LP_CAN1_RX0_IRQn); */
-  /* USER CODE END CAN1:USB_LP_CAN1_RX0_IRQn disable */
-
+    HAL_NVIC_DisableIRQ(USB_LP_CAN1_RX0_IRQn);
   /* USER CODE BEGIN CAN1_MspDeInit 1 */
 
   /* USER CODE END CAN1_MspDeInit 1 */

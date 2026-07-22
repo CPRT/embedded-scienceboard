@@ -15,10 +15,40 @@
   *
   ******************************************************************************
   */
+/* CAN MESSAGES
+ * Base ID: 30
+ *
+ * SET_MOTOR, Id: 0 (Jetson -> Science)
+ * uint8_t pin
+ * uint8_t duty_cycle (percent)
+ * uint16_t duration
+ * uint16_t ramp
+ *
+ * SET_SERVO, Id: 1 (Jetson -> Science)
+ * uint8_t pin
+ * uint16_t us
+ *
+ * POLAR_SCAN, Id: 2 (Jetson -> Science) (no data)
+ *
+ * ADC_DATA, Id: 3 (Science -> Jetson)
+ * uint16_t adc1
+ * uint16_t adc2
+ * uint16_t adc3
+ *
+ * TEMP_DATA, Id: 4 (Science -> Jetson)
+ * float temperature
+ * float humidity
+ *
+ * CO2_DATA, Id: 5 (Science -> Jetson)
+ * uint16_t ppm
+ *
+ * POLAR_DATA, Id: 6 (Science ->  Jetson)
+ * uint8_t index
+ * uint16_t[3] data
+ */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -28,43 +58,20 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
-#define MAGIC0 0xAA
-#define MAGIC1 0x55
-
-#define TYPE_DC     0x00
-#define TYPE_SERVO  0x01
-#define TYPE_POLAR  0x02
-
-#define TYPE_SENSORS 0x01
-#define TYPE_POLAR_DATA 0x02
-
-#pragma pack(push,1)
-
-typedef struct
-{
-    uint8_t pin;
-    uint8_t type;
-    uint16_t duty_cycle;
-    uint16_t duration;
-    uint16_t ramp;   
-} PwmCommand;
-
-typedef struct
-{
-    uint16_t adc1;      // ADC_CHANNEL_0 
-    uint16_t co2;
-    float temperature;
-    float moisture;
-    uint16_t adc2;         // ADC_CHANNEL_1 
-    uint16_t adc3;         // ADC_CHANNEL_4 
-} SensorReadings;
-
-#pragma pack(pop)
-
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define CAN_ID 30
+
+#define SET_MOTOR  0x00
+#define SET_SERVO  0x01
+#define POLAR_SCAN 0x02
+#define ADC_DATA   0x03
+#define TEMP_DATA  0x04
+#define CO2_DATA   0x05
+#define POLAR_DATA 0x06
+
 #define SCAN_STEPS 48
 /* USER CODE END PD */
 
@@ -89,17 +96,9 @@ UART_HandleTypeDef huart3;
 
 // Flags and tracking variables
 uint8_t start_polarimeter_scan = 0;
-//uint16_t scan_steps = 0;
 uint32_t last_dht22_read = 0;
-uint32_t last_fast_sensor_read = 0;
+uint32_t last_adc_read = 0;
 uint32_t last_co2_read = 0;
-
-// Cached DHT22 values
-float cached_temperature = 0.0f;
-float cached_moisture = 0.0f;
-
-// Cached CO2 value
-uint16_t cached_co2 = 0;
 
 #define NUM_DC_MOTORS 7
 #define NUM_SERVOS    4
@@ -153,34 +152,62 @@ static void MX_TIM4_Init(void);
 static void MX_USART3_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
-void Process_USB_Command(uint8_t* buffer, uint32_t length);
 void Run_Polarimeter_Scan(void);
 uint16_t Read_CO2_Sensor(void);
 void Read_DHT22(float *temperature, float *humidity);
 uint16_t Read_Analog_Input(uint32_t channel);
-void SendFramedPacket(uint8_t type, const uint8_t *payload, uint16_t payload_len);
 void Delay_us(uint16_t us);
-void Set_CO2_Query_Mode(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-uint8_t CalcChecksum(const uint8_t *data, uint32_t len)
-{
-    uint8_t checksum = 0;
-
-    for(uint32_t i = 0; i < len; i++)
-    {
-        checksum ^= data[i];
-    }
-
-    return checksum;
-}
-
 void Delay_us(uint16_t us) {
     uint16_t start = __HAL_TIM_GET_COUNTER(&htim4);
     while ((uint16_t)(__HAL_TIM_GET_COUNTER(&htim4) - start) < us);
 }
+
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+{
+  CAN_RxHeaderTypeDef   RxHeader;
+  uint8_t               RxData[8];
+
+  if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxHeader, RxData) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if ((RxHeader.StdId >> 5) == CAN_ID)
+  {
+	switch (RxHeader.StdId & 0x1f) {
+	  case SET_MOTOR:
+		uint8_t pin = RxData[0];
+		if (pin < NUM_DC_MOTORS)
+		{
+		  uint32_t now     = HAL_GetTick();
+		  uint32_t rampMs  = (uint32_t)((RxData[4] << 8) | RxData[5]) * 100u;
+		  uint32_t holdMs  = (uint32_t)((RxData[2] << 8) | RxData[3]) * 100u;
+
+		  dc_motors[pin].start_duty    = dc_motors[pin].current_duty;
+		  dc_motors[pin].target_duty   = RxData[1];
+		  dc_motors[pin].start_time    = now;
+		  dc_motors[pin].ramp_end_time = now + rampMs;
+		  dc_motors[pin].turn_off_time = now + holdMs;
+		}
+		break;
+
+	  case SET_SERVO:
+		if (RxData[0] < NUM_SERVOS)
+		{
+		  __HAL_TIM_SET_COMPARE(servo_map[RxData[0]].htim, servo_map[RxData[0]].channel, (RxData[1] << 8) | RxData[2]);
+		}
+		break;
+	}
+  }
+  if (HAL_CAN_ActivateNotification(hcan, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -219,9 +246,7 @@ int main(void)
   MX_TIM3_Init();
   MX_TIM4_Init();
   MX_USART3_UART_Init();
-  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
-
   for (int i = 0; i < NUM_DC_MOTORS; i++) {
       HAL_TIM_PWM_Start(dc_motor_map[i].htim, dc_motor_map[i].channel);
   }
@@ -232,6 +257,33 @@ int main(void)
 
   // Free-running 1MHz counter on TIM4, used by Delay_us() and Read_DHT22()'s timeouts
   HAL_TIM_Base_Start(&htim4);
+
+  CAN_FilterTypeDef canfilterconfig;
+
+  canfilterconfig.FilterActivation = CAN_FILTER_ENABLE;
+  canfilterconfig.FilterBank = 0;
+  canfilterconfig.FilterFIFOAssignment = CAN_FILTER_FIFO0;
+  canfilterconfig.FilterIdHigh = CAN_ID<<10;
+  canfilterconfig.FilterIdLow = 0;
+  canfilterconfig.FilterMaskIdHigh = 0x3f<<10;
+  canfilterconfig.FilterMaskIdLow = 0;
+  canfilterconfig.FilterMode = CAN_FILTERMODE_IDMASK;
+  canfilterconfig.FilterScale = CAN_FILTERSCALE_32BIT;
+
+  if (HAL_CAN_ConfigFilter(&hcan, &canfilterconfig) != HAL_OK)
+  {
+	  Error_Handler();
+  }
+
+  if (HAL_CAN_Start(&hcan) != HAL_OK)
+  {
+	  Error_Handler();
+  }
+
+  if (HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK)
+  {
+	  Error_Handler();
+  }
 
   // Reset timers
   last_dht22_read = HAL_GetTick();
@@ -291,27 +343,90 @@ int main(void)
     // Sensor Readings
     if (current_time - last_dht22_read >= 2000) {
         last_dht22_read = current_time;
-        Read_DHT22(&cached_temperature, &cached_moisture);
+
+        float temperature, moisture;
+        uint32_t temp_bytes, moisture_bytes;
+
+        Read_DHT22(&temperature, &moisture);
+
+        memcpy(&temp_bytes, &temperature, 4);
+        memcpy(&moisture_bytes, &moisture, 4);
+
+        CAN_TxHeaderTypeDef   TxHeader;
+        uint8_t               TxData[8];
+        uint32_t              TxMailbox;
+
+        TxHeader.IDE = CAN_ID_STD;
+        TxHeader.StdId = (CAN_ID << 5) | TEMP_DATA;
+        TxHeader.RTR = CAN_RTR_DATA;
+        TxHeader.DLC = 8;
+
+        TxData[0] = (temp_bytes >> 24) & 0xff;
+        TxData[1] = (temp_bytes >> 16) & 0xff;
+        TxData[2] = (temp_bytes >> 8) & 0xff;
+        TxData[3] = temp_bytes & 0xff;
+        TxData[4] = (moisture_bytes >> 24) & 0xff;
+        TxData[5] = (moisture_bytes >> 16) & 0xff;
+        TxData[6] = (moisture_bytes >> 8) & 0xff;
+        TxData[7] = moisture_bytes & 0xff;
+
+        if (HAL_CAN_AddTxMessage(&hcan, &TxHeader, TxData, &TxMailbox) != HAL_OK)
+        {
+          Error_Handler();
+        }
     }
 
     // CO2
     if (current_time - last_co2_read >= 1000) {
         last_co2_read = current_time;
-        cached_co2 = Read_CO2_Sensor();
+
+        uint16_t co2 = Read_CO2_Sensor();
+
+        CAN_TxHeaderTypeDef   TxHeader;
+        uint8_t               TxData[8];
+        uint32_t              TxMailbox;
+
+        TxHeader.IDE = CAN_ID_STD;
+        TxHeader.StdId = (CAN_ID << 5) | CO2_DATA;
+        TxHeader.RTR = CAN_RTR_DATA;
+        TxHeader.DLC = 2;
+
+        TxData[0] = (co2 >> 8) & 0xff;
+        TxData[1] = co2 & 0xff;
+
+        if (HAL_CAN_AddTxMessage(&hcan, &TxHeader, TxData, &TxMailbox) != HAL_OK)
+        {
+          Error_Handler();
+        }
     }
 
-    if (current_time - last_fast_sensor_read >= 100) {
-        last_fast_sensor_read = current_time;
+    if (current_time - last_adc_read >= 100) {
+        last_adc_read = current_time;
 
-        SensorReadings pkt;
-        pkt.adc1 = Read_Analog_Input(ADC_CHANNEL_0);
-        pkt.co2  = cached_co2;
-        pkt.adc2 = Read_Analog_Input(ADC_CHANNEL_1);
-        pkt.adc3 = Read_Analog_Input(ADC_CHANNEL_4);
-        pkt.temperature = cached_temperature;
-        pkt.moisture    = cached_moisture;
+        uint16_t adc1 = Read_Analog_Input(ADC_CHANNEL_0);
+        uint16_t adc2 = Read_Analog_Input(ADC_CHANNEL_1);
+        uint16_t adc3 = Read_Analog_Input(ADC_CHANNEL_4);
 
-        SendFramedPacket(TYPE_SENSORS, (uint8_t*)&pkt, sizeof(pkt));
+        CAN_TxHeaderTypeDef   TxHeader;
+        uint8_t               TxData[8];
+        uint32_t              TxMailbox;
+
+        TxHeader.IDE = CAN_ID_STD;
+        TxHeader.StdId = (CAN_ID << 5) | ADC_DATA;
+        TxHeader.RTR = CAN_RTR_DATA;
+        TxHeader.DLC = 6;
+
+        TxData[0] = (adc1 >> 8) & 0xff;
+        TxData[1] = adc1 & 0xff;
+        TxData[2] = (adc2 >> 8) & 0xff;
+        TxData[3] = adc2 & 0xff;
+        TxData[4] = (adc3 >> 8) & 0xff;
+        TxData[5] = adc3 & 0xff;
+
+        if (HAL_CAN_AddTxMessage(&hcan, &TxHeader, TxData, &TxMailbox) != HAL_OK)
+        {
+          Error_Handler();
+        }
     }
 
     /* USER CODE END WHILE */
@@ -359,9 +474,8 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC|RCC_PERIPHCLK_USB;
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
   PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV4;
-  PeriphClkInit.UsbClockSelection = RCC_USBCLKSOURCE_PLL;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
   {
     Error_Handler();
@@ -431,11 +545,11 @@ static void MX_CAN_Init(void)
 
   /* USER CODE END CAN_Init 1 */
   hcan.Instance = CAN1;
-  hcan.Init.Prescaler = 8;
+  hcan.Init.Prescaler = 2;
   hcan.Init.Mode = CAN_MODE_NORMAL;
-  hcan.Init.SyncJumpWidth = CAN_SJW_1TQ;
-  hcan.Init.TimeSeg1 = CAN_BS1_1TQ;
-  hcan.Init.TimeSeg2 = CAN_BS2_1TQ;
+  hcan.Init.SyncJumpWidth = CAN_SJW_2TQ;
+  hcan.Init.TimeSeg1 = CAN_BS1_8TQ;
+  hcan.Init.TimeSeg2 = CAN_BS2_3TQ;
   hcan.Init.TimeTriggeredMode = DISABLE;
   hcan.Init.AutoBusOff = DISABLE;
   hcan.Init.AutoWakeUp = DISABLE;
@@ -605,7 +719,7 @@ static void MX_TIM3_Init(void)
 
   /* USER CODE END TIM3_Init 1 */
   htim3.Instance = TIM3;
-  htim3.Init.Prescaler = 48;
+  htim3.Init.Prescaler = 48-1;
   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim3.Init.Period = 20000;
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -765,76 +879,6 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-void SendFramedPacket(uint8_t type,
-                      const uint8_t *payload,
-                      uint16_t payload_len)
-{
-    uint8_t packet[64];
-
-    if(payload_len + 4 > sizeof(packet))
-        return;
-
-    packet[0] = MAGIC0;
-    packet[1] = MAGIC1;
-    packet[2] = type;
-
-    memcpy(&packet[3], payload, payload_len);
-
-    packet[3 + payload_len] =
-        CalcChecksum(payload, payload_len);
-
-    CDC_Transmit_FS(packet, payload_len + 4);
-}
-
-void Process_USB_Command(uint8_t *buffer, uint32_t length)
-{
-    if (length < sizeof(PwmCommand) + 3)
-        return;
-
-    // Verify header
-    if (buffer[0] != MAGIC0 || buffer[1] != MAGIC1)
-        return;
-
-    // Verify checksum
-    uint8_t checksum = CalcChecksum(&buffer[2], sizeof(PwmCommand));
-
-    if (checksum != buffer[2 + sizeof(PwmCommand)])
-        return;
-
-    // Extract command
-    PwmCommand cmd;
-    memcpy(&cmd, &buffer[2], sizeof(PwmCommand));
-
-    switch (cmd.type)
-    {
-        case TYPE_DC:
-          if (cmd.pin < NUM_DC_MOTORS)
-          {
-              uint32_t now     = HAL_GetTick();
-              uint32_t rampMs  = (uint32_t)cmd.ramp * 100u;
-              uint32_t holdMs  = (uint32_t)cmd.duration * 100u;
-
-              dc_motors[cmd.pin].start_duty    = dc_motors[cmd.pin].current_duty;
-              dc_motors[cmd.pin].target_duty   = cmd.duty_cycle;
-              dc_motors[cmd.pin].start_time    = now;
-              dc_motors[cmd.pin].ramp_end_time = now + rampMs;
-              dc_motors[cmd.pin].turn_off_time = now + rampMs + holdMs;
-          }
-          break;
-
-        case TYPE_SERVO:
-            if (cmd.pin < NUM_SERVOS)
-            {
-                __HAL_TIM_SET_COMPARE(servo_map[cmd.pin].htim, servo_map[cmd.pin].channel, cmd.duty_cycle);
-            }
-            break;
-
-        case TYPE_POLAR:
-            start_polarimeter_scan = 1;
-            break;
-    }
-}
-
 void Run_Polarimeter_Scan(void) {
     ADC_ChannelConfTypeDef sConfig = {0};
     uint16_t sample_buf[SCAN_STEPS];
@@ -859,12 +903,6 @@ void Run_Polarimeter_Scan(void) {
         }
         HAL_ADC_Stop(&hadc1);
     }
-
-    SendFramedPacket(
-        TYPE_POLAR_DATA,
-        (uint8_t*)sample_buf,
-        sizeof(sample_buf)
-    );
 }
 
 uint16_t Read_CO2_Sensor(void)
@@ -873,7 +911,7 @@ uint16_t Read_CO2_Sensor(void)
     uint16_t co2_ppm = 0;
 
     // Read the active 16-byte frame from USART3
-    if (HAL_UART_Receive(&huart3, rx_buf, 16, 1000) == HAL_OK)
+    if (HAL_UART_Receive(&huart3, rx_buf, 16, 10) == HAL_OK)
     {
         // 1. Verify the active transmission packet headers (0x42, 0x4D)
         if (rx_buf[0] == 0x42 && rx_buf[1] == 0x4D)

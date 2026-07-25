@@ -98,7 +98,9 @@ UART_HandleTypeDef huart3;
 uint8_t start_polarimeter_scan = 0;
 uint32_t last_dht22_read = 0;
 uint32_t last_adc_read = 0;
-uint32_t last_co2_read = 0;
+
+uint8_t co2_buffer[16] = {0};
+int co2_good = 0;
 
 #define NUM_DC_MOTORS 7
 #define NUM_SERVOS    4
@@ -153,7 +155,6 @@ static void MX_USART3_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
 void Run_Polarimeter_Scan(void);
-uint16_t Read_CO2_Sensor(void);
 void Read_DHT22(float *temperature, float *humidity);
 uint16_t Read_Analog_Input(uint32_t channel);
 void Delay_us(uint16_t us);
@@ -206,6 +207,12 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
   {
     Error_Handler();
   }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    co2_good = 1;
+    HAL_UART_Receive_IT(&huart3, co2_buffer, 16);
 }
 
 /* USER CODE END 0 */
@@ -287,8 +294,8 @@ int main(void)
 
   // Reset timers
   last_dht22_read = HAL_GetTick();
-  last_co2_read   = HAL_GetTick();
   
+  HAL_UART_Receive_IT(&huart3, co2_buffer, 16);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -344,7 +351,7 @@ int main(void)
     if (current_time - last_dht22_read >= 2000) {
         last_dht22_read = current_time;
 
-        float temperature, moisture;
+        float temperature = 0.0f, moisture = 0.0f;
         uint32_t temp_bytes, moisture_bytes;
 
         Read_DHT22(&temperature, &moisture);
@@ -377,10 +384,25 @@ int main(void)
     }
 
     // CO2
-    if (current_time - last_co2_read >= 1000) {
-        last_co2_read = current_time;
+    if (co2_good) {
+    	co2_good = 0;
+        uint16_t co2 = 0xFFFF;
+        if (co2_buffer[0] == 0x42 && co2_buffer[1] == 0x4D)
+        {
+            // 2. Calculate the 8-bit additive checksum over bytes 0 to 14
+            uint8_t calculated_checksum = 0;
+            for (int i = 0; i < 15; i++)
+            {
+                calculated_checksum += co2_buffer[i];
+            }
 
-        uint16_t co2 = Read_CO2_Sensor();
+            // 3. Verify the computed checksum matches the packet's trailing byte
+            if (calculated_checksum == co2_buffer[15])
+            {
+                // 4. Extract CO2 PPM (BYTE 6 is High Byte, BYTE 7 is Low Byte)
+                co2 = ((uint16_t)co2_buffer[6] << 8) | co2_buffer[7];
+            }
+        }
 
         CAN_TxHeaderTypeDef   TxHeader;
         uint8_t               TxData[8];
@@ -905,37 +927,6 @@ void Run_Polarimeter_Scan(void) {
     }
 }
 
-uint16_t Read_CO2_Sensor(void)
-{
-    uint8_t rx_buf[16];
-    uint16_t co2_ppm = 0;
-
-    // Read the active 16-byte frame from USART3
-    if (HAL_UART_Receive(&huart3, rx_buf, 16, 10) == HAL_OK)
-    {
-        // 1. Verify the active transmission packet headers (0x42, 0x4D)
-        if (rx_buf[0] == 0x42 && rx_buf[1] == 0x4D)
-        {
-            // 2. Calculate the 8-bit additive checksum over bytes 0 to 14
-            uint8_t calculated_checksum = 0;
-            for (int i = 0; i < 15; i++)
-            {
-                calculated_checksum += rx_buf[i];
-            }
-
-            // 3. Verify the computed checksum matches the packet's trailing byte
-            if (calculated_checksum == rx_buf[15])
-            {
-                // 4. Extract CO2 PPM (BYTE 6 is High Byte, BYTE 7 is Low Byte)
-                co2_ppm = ((uint16_t)rx_buf[6] << 8) | rx_buf[7];
-                return co2_ppm;
-            }
-        }
-    }
-
-    return 0;
-}
-
 void Set_Pin_Output(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin) {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
     GPIO_InitStruct.Pin = GPIO_Pin;
@@ -957,6 +948,8 @@ void Read_DHT22(float *temperature, float *humidity){
     uint8_t i, j;
     uint16_t start_time;
     const uint16_t timeout_us = 200; // 200us safety limit for individual signal phases
+
+    TIM4->CNT = 0;
 
     // Host Start Signal (PB6 = TIM4_CH1 pin, used here in bit-banged GPIO mode)
     Set_Pin_Output(GPIOB, GPIO_PIN_6);
@@ -1008,7 +1001,8 @@ void Read_DHT22(float *temperature, float *humidity){
     }
 
     // Check Checksum and Parse
-    if ((data[0] + data[1] + data[2] + data[3]) == data[4]) {
+    uint8_t check = data[0] + data[1] + data[2] + data[3];
+    if (check == data[4]) {
         short raw_humidity = (data[0] << 8) | data[1];
         short raw_temperature = (data[2] << 8) | data[3];
 

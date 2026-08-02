@@ -49,6 +49,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include <string.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -73,6 +74,7 @@
 #define POLAR_DATA 0x06
 
 #define SCAN_STEPS 48
+#define MICROSTEPS 8
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -102,6 +104,14 @@ uint32_t last_adc_read = 0;
 uint8_t co2_buffer[16] = {0};
 int co2_good = 0;
 
+uint16_t sample_buf[SCAN_STEPS];
+
+uint8_t polar_step = 0;
+int polar_running = 0;
+uint32_t polar_step_time = 0;
+
+ADC_ChannelConfTypeDef polarConfig = {0};
+
 #define NUM_DC_MOTORS 7
 #define NUM_SERVOS    4
 
@@ -110,7 +120,6 @@ typedef struct {
     uint32_t channel;
 } PwmMap_t;
 
-// timer, channel for DC motors (Motor 1-3 on TIM1, Motor 4-6 on TIM2)
 static const PwmMap_t dc_motor_map[NUM_DC_MOTORS] = {
     { &htim1, TIM_CHANNEL_1 },  // Motor 1
     { &htim1, TIM_CHANNEL_2 },  // Motor 2
@@ -121,7 +130,6 @@ static const PwmMap_t dc_motor_map[NUM_DC_MOTORS] = {
     { &htim2, TIM_CHANNEL_4 }   // Heater
 };
 
-// timer, channel for servos
 static const PwmMap_t servo_map[NUM_SERVOS] = {
     { &htim3, TIM_CHANNEL_1 },
     { &htim3, TIM_CHANNEL_2 },
@@ -129,7 +137,6 @@ static const PwmMap_t servo_map[NUM_SERVOS] = {
     { &htim3, TIM_CHANNEL_4 }
 };
 
-// Motor tracking structure
 typedef struct {
     uint32_t target_duty;
     uint32_t start_duty;
@@ -154,7 +161,6 @@ static void MX_TIM4_Init(void);
 static void MX_USART3_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
-void Run_Polarimeter_Scan(void);
 void Read_DHT22(float *temperature, float *humidity);
 uint16_t Read_Analog_Input(uint32_t channel);
 void Delay_us(uint16_t us);
@@ -200,6 +206,12 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 		{
 		  __HAL_TIM_SET_COMPARE(servo_map[RxData[0]].htim, servo_map[RxData[0]].channel, (RxData[1] << 8) | RxData[2]);
 		}
+		break;
+
+	  case POLAR_SCAN:
+		polar_step = 0;
+		polar_running = 1;
+		polar_step_time = HAL_GetTick();
 		break;
 	}
   }
@@ -292,7 +304,10 @@ int main(void)
 	  Error_Handler();
   }
 
-  // Reset timers
+  polarConfig.Channel = ADC_CHANNEL_5;
+  polarConfig.Rank = ADC_REGULAR_RANK_1;
+  polarConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
+
   last_dht22_read = HAL_GetTick();
   
   HAL_UART_Receive_IT(&huart3, co2_buffer, 16);
@@ -342,9 +357,59 @@ int main(void)
     }
 
     // Polarimeter
-    if (start_polarimeter_scan) {
-        Run_Polarimeter_Scan();
-        start_polarimeter_scan = 0;
+    if (polar_running) {
+        if (HAL_GetTick() - polar_step_time >= 100) {
+        	HAL_ADC_ConfigChannel(&hadc1, &polarConfig);
+
+        	HAL_ADC_Start(&hadc1);
+        	if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
+        	    sample_buf[polar_step] = (uint16_t)HAL_ADC_GetValue(&hadc1);
+        	} else {
+        	    sample_buf[polar_step] = 0xFFFF;
+        	}
+        	HAL_ADC_Stop(&hadc1);
+
+        	for (uint16_t i = 0; i < MICROSTEPS; i++) {
+        	    HAL_GPIO_WritePin(STEP_GPIO_Port, STEP_Pin, GPIO_PIN_SET);
+        	    HAL_Delay(1);
+        	    HAL_GPIO_WritePin(STEP_GPIO_Port, STEP_Pin, GPIO_PIN_RESET);
+        	    HAL_Delay(1);
+        	}
+        	polar_step_time = HAL_GetTick();
+
+        	if ((polar_step + 1) % 3 == 0) {
+        		CAN_TxHeaderTypeDef   TxHeader;
+        		uint8_t               TxData[8];
+        		uint32_t              TxMailbox;
+
+        		TxHeader.IDE = CAN_ID_STD;
+        		TxHeader.StdId = (CAN_ID << 5) | POLAR_DATA;
+        		TxHeader.RTR = CAN_RTR_DATA;
+        		TxHeader.DLC = 7;
+
+        		TxData[0] = polar_step - 2;
+        		TxData[1] = (sample_buf[polar_step - 2] >> 8) & 0xff;
+        		TxData[2] = sample_buf[polar_step - 2] & 0xff;
+        		TxData[3] = (sample_buf[polar_step - 1] >> 8) & 0xff;
+        		TxData[4] = sample_buf[polar_step - 1] & 0xff;
+        		TxData[5] = (sample_buf[polar_step - 0] >> 8) & 0xff;
+        		TxData[6] = sample_buf[polar_step - 0] & 0xff;
+
+        		if (HAL_CAN_AddTxMessage(&hcan, &TxHeader, TxData, &TxMailbox) != HAL_OK)
+        		{
+        		  //Error_Handler();
+        		  // Dropping is better than crashing
+        		}
+        	}
+
+        	polar_step++;
+        	if (polar_step == SCAN_STEPS) {
+        		polar_running = 0;
+        		for (int i = 0; i < SCAN_STEPS; i++) {
+        			sample_buf[i] = 0;
+        		}
+        	}
+        }
     }
 
     // Sensor Readings
@@ -379,7 +444,7 @@ int main(void)
 
         if (HAL_CAN_AddTxMessage(&hcan, &TxHeader, TxData, &TxMailbox) != HAL_OK)
         {
-          Error_Handler();
+          //Error_Handler();
         }
     }
 
@@ -418,14 +483,14 @@ int main(void)
 
         if (HAL_CAN_AddTxMessage(&hcan, &TxHeader, TxData, &TxMailbox) != HAL_OK)
         {
-          Error_Handler();
+          //Error_Handler();
         }
     }
 
     if (current_time - last_adc_read >= 100) {
         last_adc_read = current_time;
 
-        uint16_t adc1 = Read_Analog_Input(ADC_CHANNEL_0);
+        uint16_t adc1 = Read_Analog_Input(ADC_CHANNEL_5);
         uint16_t adc2 = Read_Analog_Input(ADC_CHANNEL_1);
         uint16_t adc3 = Read_Analog_Input(ADC_CHANNEL_4);
 
@@ -447,7 +512,7 @@ int main(void)
 
         if (HAL_CAN_AddTxMessage(&hcan, &TxHeader, TxData, &TxMailbox) != HAL_OK)
         {
-          Error_Handler();
+          //Error_Handler();
         }
     }
 
@@ -901,32 +966,6 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-void Run_Polarimeter_Scan(void) {
-    ADC_ChannelConfTypeDef sConfig = {0};
-    uint16_t sample_buf[SCAN_STEPS];
-
-    sConfig.Channel = ADC_CHANNEL_5;
-    sConfig.Rank = ADC_REGULAR_RANK_1;
-    sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
-    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
-
-    for (uint16_t i = 0; i < SCAN_STEPS; i++) {
-        HAL_GPIO_WritePin(STEP_GPIO_Port, STEP_Pin, GPIO_PIN_SET);
-        HAL_Delay(5);
-        HAL_GPIO_WritePin(STEP_GPIO_Port, STEP_Pin, GPIO_PIN_RESET);
-        HAL_Delay(5);
-
-        // Read ADC Sample
-        HAL_ADC_Start(&hadc1);
-        if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
-            sample_buf[i] = (uint16_t)HAL_ADC_GetValue(&hadc1);
-        } else {
-            sample_buf[i] = 0xFFFF;
-        }
-        HAL_ADC_Stop(&hadc1);
-    }
-}
-
 void Set_Pin_Output(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin) {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
     GPIO_InitStruct.Pin = GPIO_Pin;
@@ -1012,7 +1051,7 @@ void Read_DHT22(float *temperature, float *humidity){
 }
 
 uint16_t Read_Analog_Input(uint32_t channel) {
-    uint16_t adc_val = 0;
+    uint16_t adc_val = 0xFFFF;
     ADC_ChannelConfTypeDef sConfig = {0};
 
     sConfig.Channel = channel;
@@ -1040,6 +1079,7 @@ void Error_Handler(void)
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
+  HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
   while (1)
   {
   }

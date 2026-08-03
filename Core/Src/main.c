@@ -49,7 +49,6 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include <string.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -114,6 +113,11 @@ ADC_ChannelConfTypeDef polarConfig = {0};
 
 #define NUM_DC_MOTORS 7
 #define NUM_SERVOS    4
+
+#define POLAR_MIN 730
+#define POLAR_MAX 2170
+#define POLAR_STEP 30
+#define POLAR_SERVO 3
 
 typedef struct {
     TIM_HandleTypeDef *htim;
@@ -359,6 +363,10 @@ int main(void)
     // Polarimeter
     if (polar_running) {
         if (HAL_GetTick() - polar_step_time >= 100) {
+        	if (polar_step == 0) {
+        		__HAL_TIM_SET_COMPARE(servo_map[POLAR_SERVO].htim, servo_map[POLAR_SERVO].channel, POLAR_MIN);
+        		HAL_Delay(1500);
+        	}
         	HAL_ADC_ConfigChannel(&hadc1, &polarConfig);
 
         	HAL_ADC_Start(&hadc1);
@@ -369,12 +377,13 @@ int main(void)
         	}
         	HAL_ADC_Stop(&hadc1);
 
-        	for (uint16_t i = 0; i < MICROSTEPS; i++) {
+        	/*for (uint16_t i = 0; i < MICROSTEPS; i++) {
         	    HAL_GPIO_WritePin(STEP_GPIO_Port, STEP_Pin, GPIO_PIN_SET);
         	    HAL_Delay(1);
         	    HAL_GPIO_WritePin(STEP_GPIO_Port, STEP_Pin, GPIO_PIN_RESET);
         	    HAL_Delay(1);
-        	}
+        	}*/
+        	__HAL_TIM_SET_COMPARE(servo_map[POLAR_SERVO].htim, servo_map[POLAR_SERVO].channel, POLAR_MIN + POLAR_STEP * polar_step);
         	polar_step_time = HAL_GetTick();
 
         	if ((polar_step + 1) % 3 == 0) {
@@ -638,9 +647,9 @@ static void MX_CAN_Init(void)
   hcan.Init.TimeSeg1 = CAN_BS1_8TQ;
   hcan.Init.TimeSeg2 = CAN_BS2_3TQ;
   hcan.Init.TimeTriggeredMode = DISABLE;
-  hcan.Init.AutoBusOff = DISABLE;
+  hcan.Init.AutoBusOff = ENABLE;
   hcan.Init.AutoWakeUp = DISABLE;
-  hcan.Init.AutoRetransmission = DISABLE;
+  hcan.Init.AutoRetransmission = ENABLE;
   hcan.Init.ReceiveFifoLocked = DISABLE;
   hcan.Init.TransmitFifoPriority = DISABLE;
   if (HAL_CAN_Init(&hcan) != HAL_OK)

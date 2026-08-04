@@ -72,7 +72,7 @@
 #define CO2_DATA   0x05
 #define POLAR_DATA 0x06
 
-#define SCAN_STEPS 48
+#define SCAN_STEPS 96
 #define MICROSTEPS 8
 /* USER CODE END PD */
 
@@ -114,9 +114,9 @@ ADC_ChannelConfTypeDef polarConfig = {0};
 #define NUM_DC_MOTORS 7
 #define NUM_SERVOS    4
 
-#define POLAR_MIN 730
-#define POLAR_MAX 2170
-#define POLAR_STEP 30
+#define POLAR_MIN 390
+#define POLAR_MAX 2310
+#define POLAR_STEP 20
 #define POLAR_SERVO 3
 
 typedef struct {
@@ -310,7 +310,7 @@ int main(void)
 
   polarConfig.Channel = ADC_CHANNEL_5;
   polarConfig.Rank = ADC_REGULAR_RANK_1;
-  polarConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
+  polarConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;
 
   last_dht22_read = HAL_GetTick();
   
